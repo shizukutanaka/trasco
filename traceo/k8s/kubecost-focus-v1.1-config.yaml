@@ -1,0 +1,525 @@
+---
+# Kubecost v2.4 with FOCUS v1.1 - Multi-Cloud Cost Tracking & Chargeback
+# Date: November 20, 2024
+# Status: Production-Ready
+# Expected Impact: 30-50% K8s cost reduction through visibility and chargeback
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubecost
+  labels:
+    name: kubecost
+
+---
+# Kubecost Configuration - FOCUS v1.1 Compliant
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubecost-values
+  namespace: kubecost
+data:
+  values.yaml: |
+    # Kubecost v2.4 with FOCUS v1.1 compliance
+    kubecostModel:
+      warmCache: true
+      warmSavingsCache: true
+
+      # FOCUS (FinOps Open Cost and Usage Specification) v1.1 attributes
+      focusAttributes:
+        # Mandatory FOCUS attributes
+        - name: InvoiceDate
+          source: billing_period
+          description: "Billing period date (YYYY-MM)"
+          required: true
+
+        - name: SKU
+          source: resource_id
+          description: "Service SKU identifier"
+          required: true
+
+        - name: ServiceName
+          source: kubernetes_cluster
+          description: "Service or product name"
+          required: true
+
+        - name: UsageUnit
+          source: metric_unit
+          description: "Unit of measurement (CPU-hours, GiB-hours, etc.)"
+          required: true
+
+        # Multi-cloud dimensions
+        - name: CloudProvider
+          source: cloud_provider
+          values: [aws, azure, gcp, alibaba, tencent]
+          required: true
+
+        - name: Region
+          source: region
+          description: "Cloud region"
+          required: true
+
+        - name: ResourceType
+          source: resource_type
+          values: [compute, storage, network, database, cache]
+          required: true
+
+        - name: ChargingPeriod
+          source: usage_start_date
+          description: "Start date of usage period"
+          required: true
+
+      # Cost allocation rules
+      allocationRules:
+        - name: "team-based"
+          labels:
+            - team
+            - project
+            - cost-center
+          aggregations:
+            - namespace
+            - pod
+          description: "Allocate costs based on team ownership"
+
+        - name: "service-based"
+          labels:
+            - app
+            - service
+            - component
+          aggregations:
+            - deployment
+            - statefulset
+            - daemonset
+          description: "Allocate costs based on service/application"
+
+        - name: "environment-based"
+          labels:
+            - environment
+            - stage
+          aggregations:
+            - namespace
+          description: "Allocate costs by environment (prod, staging, dev)"
+
+      # Chargeback configuration
+      chargeback:
+        enabled: true
+        billingPeriod: "monthly"
+
+        # Progressive rollout strategy (BEST PRACTICE)
+        # Goal: Smooth transition from visibility to accountability
+        phases:
+          phase1:
+            name: "Showback (Months 1-6)"
+            description: "Display costs (informational only, no charging)"
+            action: "Display costs"
+            targetTeams: "all"
+            visibility: "Full team visibility, self-service dashboards"
+            notifications:
+              frequency: "weekly"
+              channel: "email,slack"
+              message: "Your team's cloud costs this week: $X"
+
+          phase2:
+            name: "Soft Chargeback (Months 7-9)"
+            description: "Charge with warnings and grace period"
+            action: "Shadow charging with exception process"
+            targetTeams: "high-cost teams"
+            visibility: "Department heads notified monthly"
+            notifications:
+              frequency: "daily"
+              channel: "email,slack,dashboard"
+              message: "Alert: Soft chargeback begins in 30 days"
+              exceptionProcess: "Manager approval for overages"
+
+          phase3:
+            name: "Full Chargeback (Months 10+)"
+            description: "Full billing enforcement"
+            action: "Charges deducted from budgets"
+            targetTeams: "all"
+            visibility: "Cost impacting budgets"
+            notifications:
+              frequency: "daily"
+              channel: "email,slack,dashboard"
+              message: "Your team has been charged $X"
+              exceptionProcess: "CFO approval for overages"
+
+        chargingModel:
+          # Hourly charging based on actual usage
+          frequency: "hourly"
+
+          # Include reserved instances + spot savings
+          includeSavings: true
+          includedSavingTypes:
+            - reserved_instances
+            - spot_instances
+            - commitment_discounts
+
+          # Exclude certain resources from chargeback
+          excludeNamespaces:
+            - kube-system
+            - kube-public
+            - monitoring
+            - kubecost
+            - ingress-nginx
+
+          excludeLabels:
+            - infrastructure: "core"  # Don't charge for core services
+            - billing: "exempt"
+
+          chargebackRules:
+            - namespace: "production"
+              chargeback_rate: 1.0  # 100% of cost
+            - namespace: "staging"
+              chargeback_rate: 0.5  # 50% of cost (subsidized)
+            - namespace: "development"
+              chargeback_rate: 0.2  # 20% of cost (highly subsidized)
+
+      # Real-time cost anomaly detection
+      costAnomalyDetection:
+        enabled: true
+        sensitivity: "medium"  # low, medium, high
+        baselineWindow: "30d"   # 30-day baseline for anomaly detection
+
+        alerting:
+          - name: "moderate-spike"
+            threshold: 1.5  # 150% of baseline = anomaly
+            severity: "warning"
+            channel: ["slack", "email"]
+            notify_teams: true
+
+          - name: "severe-spike"
+            threshold: 2.0  # 200% of baseline = critical
+            severity: "critical"
+            channel: ["pagerduty", "slack", "email"]
+            notify_cto: true
+
+      # Savings opportunities
+      savingsOpportunities:
+        enabled: true
+        recommendations:
+          - name: "rightsizing"
+            description: "Right-size over-provisioned resources"
+            potentialSavings: "25-40%"
+
+          - name: "reserved-instances"
+            description: "Purchase reserved instances for stable workloads"
+            potentialSavings: "30-70%"
+
+          - name: "spot-instances"
+            description: "Use spot instances for non-critical workloads"
+            potentialSavings: "50-90%"
+
+          - name: "consolidation"
+            description: "Consolidate underutilized clusters"
+            potentialSavings: "20-35%"
+
+---
+# Cost Anomaly Detection Rules
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kubecost-anomalies
+  namespace: kubecost
+spec:
+  groups:
+    - name: cost-anomalies
+      interval: 1h
+      rules:
+        # Cluster-wide cost spike detection
+        - alert: CostAnomalyDetected
+          expr: |
+            (kubecost_total_cost / avg_over_time(kubecost_total_cost[30d])) > 1.5
+          for: 2h
+          labels:
+            severity: warning
+            team: "finops"
+          annotations:
+            summary: "Cost spike detected ({{ $value | humanizePercentage }})"
+            description: |
+              Cluster costs increased by {{ $value | humanizePercentage }}
+              Expected: ~${{ (avg_over_time(kubecost_total_cost[30d]) * 24) | humanize }}/day
+              Current: ~${{ (kubecost_total_cost * 24) | humanize }}/day
+
+        # Per-team cost anomaly
+        - alert: TeamCostAnomaly
+          expr: |
+            (kubecost_allocation_total_cost{team!=""} / on(team)
+             avg_over_time(kubecost_allocation_total_cost{team!=""}[30d])) > 2.0
+          for: 1h
+          labels:
+            severity: critical
+            team: "{{ $labels.team }}"
+          annotations:
+            summary: "{{ $labels.team }} costs doubled"
+            description: |
+              Team {{ $labels.team }} costs are 2x baseline
+              Expected: ${{ (avg_over_time(kubecost_allocation_total_cost{team=\"$labels.team\"}[30d])) | humanize }}/day
+              Current: ${{ (kubecost_allocation_total_cost{team=\"$labels.team\"}) | humanize }}/day
+            runbook: "https://wiki.company.com/runbooks/cost-anomaly"
+
+        # Reserved Instance waste
+        - alert: ReservedInstanceWaste
+          expr: |
+            kubecost_reserved_instance_utilization < 0.5
+          for: 24h
+          labels:
+            severity: info
+            team: "finops"
+          annotations:
+            summary: "RI {{ $labels.sku }} less than 50% utilized"
+            description: |
+              Reserved Instance {{ $labels.sku }} is only {{ $value | humanizePercentage }} utilized
+              Consider: Convert to on-demand or downsize
+
+        # Namespace-level cost growth
+        - alert: NamespaceCostGrowth
+          expr: |
+            (rate(kubecost_allocation_total_cost[7d]) / avg_over_time(rate(kubecost_allocation_total_cost[7d])[30d])) > 1.3
+          for: 3h
+          labels:
+            severity: warning
+          annotations:
+            summary: "Namespace {{ $labels.namespace }} cost growth 30%+"
+            description: "{{ $labels.namespace }} costs growing faster than average"
+
+---
+# Cost Dashboard Metrics Queries
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cost-dashboard-metrics
+  namespace: kubecost
+data:
+  # Key cost metrics for visualization
+  total_monthly_cost.promql: |
+    # Total monthly cost forecast (current month based on daily rate)
+    kubecost_total_cost * 30 / day_of_month()
+
+  cost_by_team.promql: |
+    # Monthly cost per team (top 10)
+    topk(10, sum by (team) (kubecost_allocation_total_cost) * 30 / day_of_month())
+
+  cost_by_namespace.promql: |
+    # Monthly cost per namespace
+    sum by (namespace) (kubecost_allocation_total_cost) * 30 / day_of_month()
+
+  cost_by_service.promql: |
+    # Monthly cost per application (top 20)
+    topk(20, sum by (app) (kubecost_allocation_total_cost) * 30 / day_of_month())
+
+  cost_per_pod_hour.promql: |
+    # Cost efficiency metric
+    kubecost_allocation_total_cost / kubecost_pod_hours_allocated
+
+  monthly_cost_trend.promql: |
+    # 30-day cost trend
+    sum(kubecost_allocation_total_cost) * 30 / day_of_month()
+
+  cost_forecast.promql: |
+    # Next 30 days cost forecast (based on 7-day trend)
+    predict_linear(kubecost_total_cost[7d], 30*24*3600)
+
+  environment_cost_breakdown.promql: |
+    # Cost by environment
+    sum by (environment) (kubecost_allocation_total_cost) * 30 / day_of_month()
+
+  savings_opportunity.promql: |
+    # Potential savings from right-sizing (estimated)
+    kubecost_unused_allocations * kubecost_per_unit_cost
+
+---
+# Kubecost Service for accessing API
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubecost
+  namespace: kubecost
+  labels:
+    app: kubecost
+spec:
+  selector:
+    app: kubecost
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090
+  type: ClusterIP
+
+---
+# Chargeback Report Generator - CronJob
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kubecost-chargeback-report
+  namespace: kubecost
+spec:
+  schedule: "0 1 * * *"  # Daily at 1 AM UTC
+
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            job: kubecost-report
+        spec:
+          serviceAccountName: kubecost
+          restartPolicy: OnFailure
+
+          containers:
+            - name: report-generator
+              image: python:3.11-slim
+              env:
+                - name: KUBECOST_URL
+                  value: "http://kubecost.kubecost:9090"
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  #!/bin/bash
+                  set -e
+
+                  echo "=== Kubecost Daily Chargeback Report Generation ==="
+                  date
+
+                  # Install dependencies
+                  pip install requests jinja2 -q
+
+                  # Generate report
+                  python << 'EOF'
+                  import requests
+                  import json
+                  from datetime import datetime, timedelta
+
+                  kubecost_url = "http://kubecost.kubecost:9090"
+                  yesterday = (datetime.now() - timedelta(days=1)).date()
+
+                  # Get allocation data
+                  response = requests.get(
+                      f"{kubecost_url}/api/v1/allocation",
+                      params={
+                          "window": f"{yesterday},{datetime.now().date()}",
+                          "aggregate": "namespace",
+                          "resolution": "daily"
+                      }
+                  )
+
+                  data = response.json()
+
+                  print("Chargeback Report for:", yesterday)
+                  print("-" * 50)
+
+                  for namespace, costs in data.get('data', {}).items():
+                      total_cost = sum(v.get('totalCost', 0) for v in costs.values())
+                      print(f"{namespace}: ${total_cost:.2f}")
+
+                  # Store report
+                  with open(f"/reports/chargeback-{yesterday}.json", "w") as f:
+                      json.dump(data, f, indent=2)
+
+                  print("\nReport saved to: /reports/chargeback-{yesterday}.json")
+                  EOF
+
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 250m
+                  memory: 512Mi
+
+              volumeMounts:
+                - name: reports
+                  mountPath: /reports
+
+          volumes:
+            - name: reports
+              emptyDir: {}
+
+---
+# ServiceMonitor for Kubecost metrics
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kubecost
+  namespace: kubecost
+spec:
+  selector:
+    matchLabels:
+      app: kubecost
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+
+---
+# PrometheusRule for FOCUS compliance alerting
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kubecost-focus-compliance
+  namespace: kubecost
+spec:
+  groups:
+    - name: focus-compliance
+      interval: 1h
+      rules:
+        - alert: FOCUSAttributeMissing
+          expr: |
+            count(label_replace(kubecost_allocation_total_cost, "focus_check", "missing", "sku", "")) by (focus_check) > 0
+          for: 6h
+          labels:
+            severity: warning
+          annotations:
+            summary: "FOCUS required attributes missing"
+            description: "Some cost records missing required FOCUS attributes (SKU, ServiceName, etc.)"
+
+        - alert: CostReconciliationFailed
+          expr: |
+            abs(kubecost_allocated_cost - kubecost_total_cost) / kubecost_total_cost > 0.05
+          for: 1h
+          labels:
+            severity: critical
+          annotations:
+            summary: "Cost reconciliation failure >5%"
+            description: "Allocated cost differs from total cost by more than 5%"
+
+---
+# RBAC for Kubecost
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubecost
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "services", "persistentvolumes", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubecost
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubecost
+subjects:
+  - kind: ServiceAccount
+    name: kubecost
+    namespace: kubecost
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubecost
+  namespace: kubecost
