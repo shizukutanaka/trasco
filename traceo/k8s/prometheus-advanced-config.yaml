@@ -1,0 +1,566 @@
+###############################################################################
+# Advanced Production-Grade Prometheus Configuration for Kubernetes
+#
+# This configuration implements industry best practices including:
+# - SLO/SLI monitoring with multi-window multi-burn-rate alerts
+# - Cardinality management and metric explosion prevention
+# - Remote storage integration (Thanos/Mimir/VictoriaMetrics)
+# - Exemplars and distributed tracing integration
+# - Advanced TSDB tuning and performance optimization
+# - Comprehensive monitoring patterns
+#
+# Sources: CNCF SLO workgroup, Google SRE book, Grafana Loki team, real-world deployments
+###############################################################################
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-advanced-config
+  namespace: traceo
+  labels:
+    app: prometheus
+    version: v2
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      scrape_timeout: 10s
+      evaluation_interval: 30s
+
+      external_labels:
+        cluster: 'traceo-prod'
+        environment: 'production'
+        replica: '$(POD_NAME)'
+        region: 'us-east-1'
+
+    # Feature flags
+    feature_gates: "exemplar-storage,native-histograms"
+
+    # Alert manager configuration with HA deduplication
+    alerting:
+      alert_relabel_configs:
+        # Remove replica label for deduplication
+        - source_labels: [replica]
+          action: labeldrop
+        # Group alerts by alert name
+        - source_labels: [alertname]
+          action: labelmap
+          regex: (.+)
+
+      alertmanagers:
+        - kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+              - traceo
+          relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: alertmanager
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            action: keep
+            regex: 9093
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: alertmanager
+
+    # Rule files - separate files for clarity and reusability
+    rule_files:
+      - '/etc/prometheus/rules/recording-rules.yml'
+      - '/etc/prometheus/rules/alert-rules.yml'
+      - '/etc/prometheus/rules/slo-rules.yml'
+
+    # Remote write for long-term storage (Mimir/Thanos/VictoriaMetrics)
+    remote_write:
+      # Primary: Mimir for long-term centralized metrics
+      - url: "http://mimir-distributor.monitoring:8080/api/v1/push"
+        name: mimir-primary
+        queue_config:
+          # Queue capacity for samples
+          capacity: 10000
+          # Max number of parallel shards
+          max_shards: 200
+          # Min shards to start with
+          min_shards: 1
+          # Samples per request
+          max_samples_per_send: 5000
+          # Batch deadline
+          batch_send_deadline: 5s
+          # Backoff strategy
+          min_backoff: 30ms
+          max_backoff: 5s
+          # Retry on 429 (rate limit)
+          retry_on_http_429: true
+
+        # Metadata configuration
+        metadata_config:
+          send: true
+          send_interval: 1m
+
+        # Write relabel configs for cardinality management
+        write_relabel_configs:
+          # Drop internal Go runtime metrics
+          - source_labels: [__name__]
+            regex: 'go_.*|process_.*|promhttp_.*'
+            action: drop
+
+          # Drop low-value prometheus metrics
+          - source_labels: [__name__]
+            regex: 'prometheus_.*'
+            action: drop
+
+          # Drop endpoint labels for cardinality reduction
+          - source_labels: [endpoint]
+            action: labeldrop
+
+      # Secondary: Remote storage for redundancy (optional)
+      - url: "http://prometheus-remote-backup:9009/api/v1/write"
+        name: backup-storage
+        queue_config:
+          capacity: 5000
+          max_shards: 50
+          min_shards: 1
+          max_samples_per_send: 1000
+          batch_send_deadline: 10s
+
+    # OTLP receiver for OpenTelemetry integration
+    # CLI flags required: --web.enable-otlp-receiver --enable-feature=exemplar-storage
+    otlp:
+      # Translation strategy for OpenMetrics
+      translation_strategy: NoUTF8EscapingWithSuffixes
+      # Promote resource attributes to metric labels
+      promote_resource_attributes:
+        - service.name
+        - service.namespace
+        - deployment.environment
+
+    # Scrape configurations with advanced features
+    scrape_configs:
+
+      # =========================================================================
+      # Prometheus Self-Monitoring (High Priority)
+      # =========================================================================
+      - job_name: 'prometheus'
+        scrape_interval: 15s  # More frequent for reliability
+        scrape_timeout: 5s
+        static_configs:
+          - targets: ['localhost:9090']
+        metric_relabel_configs:
+          - source_labels: [__name__]
+            regex: 'prometheus_tsdb.*|prometheus_rule.*|prometheus_sd.*'
+            action: keep
+
+      # =========================================================================
+      # Kubernetes Control Plane Monitoring
+      # =========================================================================
+
+      # API Server metrics
+      - job_name: 'kubernetes-apiservers'
+        scrape_interval: 30s
+        scrape_timeout: 10s
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+        kubernetes_sd_configs:
+        - role: endpoints
+          namespaces:
+            names:
+            - default
+
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_service_name]
+          action: keep
+          regex: 'kubernetes'
+        - source_labels: [__meta_kubernetes_endpoint_port_name]
+          action: keep
+          regex: 'https'
+
+      # kube-state-metrics (Kubernetes object state)
+      - job_name: 'kube-state-metrics'
+        scrape_interval: 30s
+        scrape_timeout: 10s
+        honor_labels: true
+
+        kubernetes_sd_configs:
+        - role: service
+          namespaces:
+            names:
+            - monitoring
+
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_service_label_app_kubernetes_io_name]
+          action: keep
+          regex: 'kube-state-metrics'
+        - source_labels: [__meta_kubernetes_service_port_name]
+          action: keep
+          regex: 'metrics'
+
+        metric_relabel_configs:
+          # Keep essential kube-state metrics only
+          - source_labels: [__name__]
+            regex: 'kube_(pod_status_phase|deployment_status_replicas|deployment_spec_replicas|statefulset_status_replicas|job_status|node_status|persistentvolumeclaim_status_phase|persistentvolume_status_phase)'
+            action: keep
+
+          # Drop metrics with high cardinality
+          - source_labels: [__name__]
+            regex: 'kube_pod_container_status_terminated_reason'
+            action: drop
+
+        sample_limit: 100000
+
+      # Node Exporter (Host metrics)
+      - job_name: 'node-exporter'
+        scrape_interval: 60s  # Lower frequency for cost optimization
+        scrape_timeout: 10s
+
+        kubernetes_sd_configs:
+        - role: endpoints
+          namespaces:
+            names:
+            - monitoring
+
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_service_label_app]
+          action: keep
+          regex: 'node-exporter'
+        - source_labels: [__meta_kubernetes_endpoint_port_name]
+          action: keep
+          regex: 'metrics'
+        - source_labels: [__meta_kubernetes_pod_node_name]
+          target_label: node
+
+        metric_relabel_configs:
+          # Keep only essential node metrics
+          - source_labels: [__name__]
+            regex: 'node_(cpu_seconds_total|memory_MemAvailable_bytes|memory_MemTotal_bytes|filesystem_avail_bytes|filesystem_size_bytes|disk_read_bytes_total|disk_write_bytes_total|network_receive_bytes_total|network_transmit_bytes_total|load_average.*|uname_info)'
+            action: keep
+
+      # =========================================================================
+      # Kubelet Metrics (Container & Pod metrics via cAdvisor)
+      # =========================================================================
+
+      # Kubelet on each node for container metrics
+      - job_name: 'kubernetes-kubelet'
+        scheme: https
+        scrape_interval: 30s
+        scrape_timeout: 10s
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+        kubernetes_sd_configs:
+        - role: node
+
+        relabel_configs:
+        - action: labelmap
+          regex: __meta_kubernetes_node_label_(.+)
+        - source_labels: [__address__]
+          regex: '([^:]+)(?::\d+)?'
+          replacement: '${1}:10250'
+          target_label: __address__
+        - source_labels: [__meta_kubernetes_node_name]
+          target_label: node
+
+        metric_relabel_configs:
+          # Keep kubelet core metrics
+          - source_labels: [__name__]
+            regex: 'kubelet_(pod_start_duration_seconds_.*|pod_worker_duration_seconds_.*|runtime_operations_duration_seconds_.*|network_plugin_operations_duration_seconds_.*|volume_.*|cgroup_.*)'
+            action: keep
+
+      # cAdvisor metrics from kubelet
+      - job_name: 'kubernetes-cadvisor'
+        scheme: https
+        scrape_interval: 30s
+        scrape_timeout: 10s
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+        kubernetes_sd_configs:
+        - role: node
+
+        relabel_configs:
+        - action: labelmap
+          regex: __meta_kubernetes_node_label_(.+)
+        - target_label: __address__
+          replacement: kubernetes.default.svc:443
+        - source_labels: [__meta_kubernetes_node_name]
+          regex: (.+)
+          target_label: __metrics_path__
+          replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+
+        metric_relabel_configs:
+          # Container metrics
+          - source_labels: [__name__]
+            regex: 'container_(cpu_usage_seconds_total|memory_working_set_bytes|memory_max_usage_bytes|network_receive_bytes_total|network_transmit_bytes_total|fs_usage_bytes|fs_limit_bytes|io_usage_bytes|pids_current|pids_limit|spec_memory_swap_limit_bytes)'
+            action: keep
+
+          # Drop empty container label (pause containers)
+          - source_labels: [container]
+            regex: '^$'
+            action: drop
+
+          # Drop empty pod label
+          - source_labels: [pod]
+            regex: '^$'
+            action: drop
+
+      # =========================================================================
+      # Application & Service Monitoring
+      # =========================================================================
+
+      # Backend API services (via K8s pod discovery)
+      - job_name: 'kubernetes-pods'
+        scrape_interval: 30s
+        scrape_timeout: 10s
+        honor_labels: true
+
+        kubernetes_sd_configs:
+        - role: pod
+          namespaces:
+            names:
+            - traceo
+
+        relabel_configs:
+          # Only scrape pods with prometheus.io/scrape annotation
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: 'true'
+
+          # Use custom port if specified
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            target_label: __address__
+            regex: ([^:]+)(?::\d+)?:(.+)
+            replacement: ${1}:${2}
+
+          # Use custom path if specified
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+
+          # Use custom scrape interval if specified
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_interval]
+            action: replace
+            target_label: __scrape_interval__
+
+          # Add standard labels
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: app
+          - source_labels: [__meta_kubernetes_pod_label_version]
+            target_label: version
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+
+        # Cardinality limits
+        sample_limit: 100000
+        label_limit: 50
+        label_name_length_limit: 128
+        label_value_length_limit: 256
+
+        metric_relabel_configs:
+          # Drop high-cardinality endpoints
+          - source_labels: [__name__]
+            regex: '.*_request_path|.*_uri'
+            action: drop
+
+          # Drop debug metrics
+          - source_labels: [__name__]
+            regex: 'debug_.*'
+            action: drop
+
+          # Aggregate user_id to user_segment for cardinality control
+          - source_labels: [user_id]
+            regex: '(.)(.*)'
+            target_label: user_segment
+            replacement: '${1}*'
+            action: replace
+
+      # PostgreSQL metrics
+      - job_name: 'postgresql'
+        scrape_interval: 30s
+        scrape_timeout: 10s
+
+        kubernetes_sd_configs:
+        - role: service
+          namespaces:
+            names:
+            - traceo
+
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_service_label_app]
+          action: keep
+          regex: 'postgresql'
+        - source_labels: [__meta_kubernetes_service_port_name]
+          action: keep
+          regex: 'metrics'
+
+        metric_relabel_configs:
+          - source_labels: [__name__]
+            regex: 'pg_(stat_.*|locks_.*|database.*|table.*|index.*|cache_hit_ratio)'
+            action: keep
+
+      # Redis metrics
+      - job_name: 'redis'
+        scrape_interval: 30s
+        scrape_timeout: 10s
+
+        kubernetes_sd_configs:
+        - role: service
+          namespaces:
+            names:
+            - traceo
+
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_service_label_app]
+          action: keep
+          regex: 'redis'
+        - source_labels: [__meta_kubernetes_service_port_name]
+          action: keep
+          regex: 'metrics'
+
+      # =========================================================================
+      # Distributed Tracing Integration (Optional)
+      # =========================================================================
+
+      # Jaeger/Tempo metrics
+      - job_name: 'jaeger'
+        scrape_interval: 30s
+        static_configs:
+          - targets: ['jaeger:14269']
+        metric_relabel_configs:
+          - source_labels: [__name__]
+            regex: 'jaeger_.*'
+            action: keep
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-slo-rules
+  namespace: traceo
+  labels:
+    app: prometheus
+    version: v2
+data:
+  slo-rules.yml: |
+    # SLO/SLI Rules using multi-window multi-burn-rate pattern
+    # Based on: Google SRE book, CNCF SLO workgroup, Sloth framework
+
+    groups:
+      - name: api_gateway_slo
+        interval: 30s
+        rules:
+          # SLI: Request success rate
+          - record: slo:api_gateway:requests_total:rate5m
+            expr: sum(rate(http_requests_total{job="backend"}[5m])) by (job)
+
+          - record: slo:api_gateway:requests_errors:rate5m
+            expr: sum(rate(http_requests_total{job="backend",status=~"5.."}[5m])) by (job)
+
+          # SLI: Request latency (p99)
+          - record: slo:api_gateway:latency:p99_5m
+            expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{job="backend"}[5m])) by (le, job))
+
+          # Calculate error ratio
+          - record: slo:api_gateway:error_ratio:rate5m
+            expr: |
+              (sum(rate(http_requests_total{job="backend",status=~"5.."}[5m])) by (job))
+              /
+              (sum(rate(http_requests_total{job="backend"}[5m])) by (job))
+
+          # Calculate latency ratio
+          - record: slo:api_gateway:latency_ratio:rate5m
+            expr: |
+              sum(rate(http_request_duration_seconds_bucket{job="backend",le="1"}[5m])) by (job)
+              /
+              sum(rate(http_request_duration_seconds_bucket{job="backend",le="+Inf"}[5m])) by (job)
+
+          # SLO: 99.9% availability (0.1% error budget = 3 errors per 3000 requests in 5 min)
+          # Window 1: 5m window, 1h burn rate (burn 14.4% per 5m if SLO violated)
+          - record: slo:api_gateway:error_ratio:rate5m_burn
+            expr: slo:api_gateway:error_ratio:rate5m * 14400  # 14.4% * 100 * 60s / 5m
+
+          - record: slo:api_gateway:error_ratio:rate1h_burn
+            expr: |
+              (sum(rate(http_requests_total{job="backend",status=~"5.."}[1h])) by (job))
+              /
+              (sum(rate(http_requests_total{job="backend"}[1h])) by (job))
+              * 14400
+
+          # Window 2: 30m window, 6h burn rate
+          - record: slo:api_gateway:error_ratio:rate30m_burn
+            expr: |
+              (sum(rate(http_requests_total{job="backend",status=~"5.."}[30m])) by (job))
+              /
+              (sum(rate(http_requests_total{job="backend"}[30m])) by (job))
+              * 3600  # 6% burn rate
+
+          - record: slo:api_gateway:error_ratio:rate6h_burn
+            expr: |
+              (sum(rate(http_requests_total{job="backend",status=~"5.."}[6h])) by (job))
+              /
+              (sum(rate(http_requests_total{job="backend"}[6h])) by (job))
+              * 3600
+
+          # Window 3: 2h window, 1d burn rate
+          - record: slo:api_gateway:error_ratio:rate2h_burn
+            expr: |
+              (sum(rate(http_requests_total{job="backend",status=~"5.."}[2h])) by (job))
+              /
+              (sum(rate(http_requests_total{job="backend"}[2h])) by (job))
+              * 1200  # 3% burn rate
+
+          - record: slo:api_gateway:error_ratio:rate1d_burn
+            expr: |
+              (sum(rate(http_requests_total{job="backend",status=~"5.."}[1d])) by (job))
+              /
+              (sum(rate(http_requests_total{job="backend"}[1d])) by (job))
+              * 1200
+
+          # Window 4: 6h window, 3d burn rate
+          - record: slo:api_gateway:error_ratio:rate6h_burn_long
+            expr: |
+              (sum(rate(http_requests_total{job="backend",status=~"5.."}[6h])) by (job))
+              /
+              (sum(rate(http_requests_total{job="backend"}[6h])) by (job))
+              * 300  # 1% burn rate
+
+          - record: slo:api_gateway:error_ratio:rate3d_burn
+            expr: |
+              (sum(rate(http_requests_total{job="backend",status=~"5.."}[3d])) by (job))
+              /
+              (sum(rate(http_requests_total{job="backend"}[3d])) by (job))
+              * 300
+
+      - name: database_slo
+        interval: 30s
+        rules:
+          # Database availability SLI
+          - record: slo:database:available:ratio
+            expr: |
+              (
+                pg_up{job="postgresql"}
+                and
+                pg_stat_database_tup_fetched{datname="production"} > 0
+              ) * 1
+
+          # Database query latency
+          - record: slo:database:query_latency:p99
+            expr: |
+              histogram_quantile(0.99,
+                sum(rate(pg_slow_queries_seconds_bucket[5m])) by (le, datname)
+              )
+
+          # Data consistency check
+          - record: slo:database:replication_lag:seconds
+            expr: |
+              pg_replication_lag_seconds{job="postgresql"}

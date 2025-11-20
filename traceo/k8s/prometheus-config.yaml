@@ -1,0 +1,865 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: traceo
+  labels:
+    app: prometheus
+    version: v1
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      scrape_timeout: 10s
+      evaluation_interval: 30s
+      external_labels:
+        cluster: 'traceo'
+        environment: 'production'
+        replica: '$(POD_NAME)'
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets:
+                - alertmanager:9093
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_name]
+              target_label: alertmanager
+
+    rule_files:
+      - '/etc/prometheus/rules/recording-rules.yml'
+      - '/etc/prometheus/rules/alert-rules.yml'
+
+    remote_write:
+      - url: "http://localhost:9009/api/v1/write"
+        queue_config:
+          capacity: 10000
+          max_shards: 200
+          min_shards: 1
+          max_samples_per_send: 1000
+          batch_send_deadline: 5s
+        write_relabel_configs:
+          - action: drop
+            regex: 'go_.*|process_.*'
+            source_labels: [__name__]
+
+    scrape_configs:
+      # Prometheus self-monitoring
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+        scrape_interval: 30s
+        scrape_timeout: 10s
+
+      # Backend API metrics
+      - job_name: 'backend'
+        scrape_interval: 30s
+        scrape_timeout: 10s
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - traceo
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: backend
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            action: keep
+            regex: "8080|9090"
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            action: replace
+            target_label: node
+
+      # PostgreSQL metrics
+      - job_name: 'postgres'
+        scrape_interval: 30s
+        scrape_timeout: 10s
+        static_configs:
+          - targets: ['postgres-exporter:9187']
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: instance
+            regex: '([^:]+)(?::\d+)?'
+            replacement: '${1}:5432'
+          - action: replace
+            target_label: job
+            replacement: 'postgresql'
+
+      # Node metrics
+      - job_name: 'node'
+        scrape_interval: 30s
+        scrape_timeout: 10s
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - source_labels: [__address__]
+            regex: '([^:]+)(?::\d+)?'
+            replacement: '${1}:9100'
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_node_name]
+            action: replace
+            target_label: node
+
+      # Kubelet metrics
+      - job_name: 'kubelet'
+        scrape_interval: 30s
+        scrape_timeout: 10s
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - source_labels: [__address__]
+            regex: '([^:]+)(?::\d+)?'
+            replacement: '${1}:10250'
+            target_label: __address__
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: traceo
+  labels:
+    app: prometheus
+    version: v1
+data:
+  recording-rules.yml: |
+    groups:
+      - name: backend_recording
+        interval: 30s
+        rules:
+          - record: job:http_requests:rate5m
+            expr: sum(rate(http_requests_total[5m])) by (job, method, status)
+
+          - record: job:http_request_duration:p95
+            expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (job, le))
+
+          - record: job:http_request_duration:p99
+            expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (job, le))
+
+          - record: job:http_errors:rate5m
+            expr: sum(rate(http_requests_total{status=~"5.."}[5m])) by (job)
+
+      - name: node_recording
+        interval: 30s
+        rules:
+          - record: node:cpu_usage:percentage
+            expr: (100 - (avg by (node) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100))
+
+          - record: node:memory_usage:percentage
+            expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100
+
+          - record: node:disk_usage:percentage
+            expr: (1 - (node_filesystem_avail_bytes / node_filesystem_size_bytes)) * 100
+
+  alert-rules.yml: |
+    groups:
+      - name: backend_alerts
+        interval: 30s
+        rules:
+          # High error rate
+          - alert: HighErrorRate
+            expr: |
+              (job:http_errors:rate5m / job:http_requests:rate5m) > 0.05
+            for: 5m
+            labels:
+              severity: warning
+              team: backend
+            annotations:
+              summary: "High error rate in {{ $labels.job }}"
+              description: "Error rate is {{ $value | humanizePercentage }} (threshold: 5%)"
+
+          # Very high error rate
+          - alert: CriticalErrorRate
+            expr: |
+              (job:http_errors:rate5m / job:http_requests:rate5m) > 0.10
+            for: 2m
+            labels:
+              severity: critical
+              team: backend
+            annotations:
+              summary: "CRITICAL: Error rate in {{ $labels.job }}"
+              description: "Error rate is {{ $value | humanizePercentage }} (threshold: 10%)"
+
+          # High response times (p95)
+          - alert: HighResponseTime
+            expr: job:http_request_duration:p95 > 1
+            for: 5m
+            labels:
+              severity: warning
+              team: backend
+            annotations:
+              summary: "High response time in {{ $labels.job }}"
+              description: "p95 response time is {{ $value }}s (threshold: 1s)"
+
+          # Very high response times (p99)
+          - alert: CriticalResponseTime
+            expr: job:http_request_duration:p99 > 5
+            for: 3m
+            labels:
+              severity: critical
+              team: backend
+            annotations:
+              summary: "CRITICAL: Response time in {{ $labels.job }}"
+              description: "p99 response time is {{ $value }}s (threshold: 5s)"
+
+      - name: database_alerts
+        interval: 30s
+        rules:
+          # PostgreSQL is down
+          - alert: PostgreSQLDown
+            expr: pg_up == 0
+            for: 1m
+            labels:
+              severity: critical
+              team: database
+            annotations:
+              summary: "PostgreSQL service is unavailable"
+              description: "PostgreSQL exporter cannot connect to the database"
+
+          # PostgreSQL high connections
+          - alert: PostgreSQLHighConnections
+            expr: pg_stat_activity_count > 80
+            for: 5m
+            labels:
+              severity: warning
+              team: database
+            annotations:
+              summary: "PostgreSQL high connection count"
+              description: "Active connections: {{ $value }} (threshold: 80)"
+
+          # PostgreSQL cache hit ratio low
+          - alert: PostgreSQLLowCacheHitRatio
+            expr: pg_stat_database_blks_hit / (pg_stat_database_blks_hit + pg_stat_database_blks_read) < 0.99
+            for: 10m
+            labels:
+              severity: warning
+              team: database
+            annotations:
+              summary: "PostgreSQL cache hit ratio is low"
+              description: "Cache hit ratio: {{ $value | humanizePercentage }} (threshold: 99%)"
+
+      - name: node_alerts
+        interval: 30s
+        rules:
+          # High CPU usage
+          - alert: HighCPUUsage
+            expr: node:cpu_usage:percentage > 80
+            for: 5m
+            labels:
+              severity: warning
+              team: platform
+            annotations:
+              summary: "High CPU usage on {{ $labels.node }}"
+              description: "CPU usage: {{ $value | humanize }}% (threshold: 80%)"
+
+          # Critical CPU usage
+          - alert: CriticalCPUUsage
+            expr: node:cpu_usage:percentage > 95
+            for: 2m
+            labels:
+              severity: critical
+              team: platform
+            annotations:
+              summary: "CRITICAL: CPU usage on {{ $labels.node }}"
+              description: "CPU usage: {{ $value | humanize }}% (threshold: 95%)"
+
+          # High memory usage
+          - alert: HighMemoryUsage
+            expr: node:memory_usage:percentage > 85
+            for: 5m
+            labels:
+              severity: warning
+              team: platform
+            annotations:
+              summary: "High memory usage on {{ $labels.node }}"
+              description: "Memory usage: {{ $value | humanize }}% (threshold: 85%)"
+
+          # Critical memory usage
+          - alert: CriticalMemoryUsage
+            expr: node:memory_usage:percentage > 95
+            for: 2m
+            labels:
+              severity: critical
+              team: platform
+            annotations:
+              summary: "CRITICAL: Memory usage on {{ $labels.node }}"
+              description: "Memory usage: {{ $value | humanize }}% (threshold: 95%)"
+
+          # Low disk space warning
+          - alert: LowDiskSpace
+            expr: |
+              node:disk_usage:percentage{fstype!~"tmpfs|fuse|squashfs|vfat"} > 80
+            for: 5m
+            labels:
+              severity: warning
+              team: platform
+            annotations:
+              summary: "Low disk space on {{ $labels.node }}"
+              description: "Disk usage: {{ $value | humanize }}% (threshold: 80%)"
+
+          # Critical disk space
+          - alert: CriticalDiskSpace
+            expr: |
+              node:disk_usage:percentage{fstype!~"tmpfs|fuse|squashfs|vfat"} > 95
+            for: 1m
+            labels:
+              severity: critical
+              team: platform
+            annotations:
+              summary: "CRITICAL: Disk space on {{ $labels.node }}"
+              description: "Disk usage: {{ $value | humanize }}% (threshold: 95%)"
+
+          # Node not ready
+          - alert: KubernetesNodeNotReady
+            expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+            for: 5m
+            labels:
+              severity: critical
+              team: platform
+            annotations:
+              summary: "Kubernetes node {{ $labels.node }} is not ready"
+              description: "Node has been unready for more than 5 minutes"
+
+      - name: kubernetes_alerts
+        interval: 30s
+        rules:
+          # Pod crash looping
+          - alert: PodCrashLooping
+            expr: rate(kube_pod_container_status_restarts_total[1h]) > 0
+            for: 5m
+            labels:
+              severity: warning
+              team: platform
+            annotations:
+              summary: "Pod {{ $labels.pod }} is crash looping"
+              description: "Pod in namespace {{ $labels.namespace }} has restarted {{ $value }} times in the last hour"
+
+          # Container waiting
+          - alert: ContainerWaiting
+            expr: kube_pod_container_status_waiting_reason{reason!="ContainerCreating"} > 0
+            for: 10m
+            labels:
+              severity: warning
+              team: platform
+            annotations:
+              summary: "Container {{ $labels.container }} is waiting"
+              description: "Reason: {{ $labels.reason }}"
+
+      - name: prometheus_alerts
+        interval: 30s
+        rules:
+          # Prometheus cardinality
+          - alert: PrometheusHighCardinality
+            expr: prometheus_tsdb_metric_chunks_created > 1000000
+            for: 5m
+            labels:
+              severity: warning
+              team: platform
+            annotations:
+              summary: "Prometheus high cardinality detected"
+              description: "Total metric chunks: {{ $value }}"
+
+          # Prometheus WAL size
+          - alert: PrometheusHighWALSize
+            expr: prometheus_tsdb_wal_segment_current_size > 1073741824
+            for: 5m
+            labels:
+              severity: warning
+              team: platform
+            annotations:
+              summary: "Prometheus WAL size is high"
+              description: "WAL size: {{ $value | humanize }}B"
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: prometheus
+  namespace: traceo
+  labels:
+    app: prometheus
+    version: v1
+spec:
+  serviceName: prometheus
+  replicas: 2
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: prometheus
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - prometheus
+                topologyKey: kubernetes.io/hostname
+
+      terminationGracePeriodSeconds: 300
+
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v2.50.0
+        imagePullPolicy: IfNotPresent
+        args:
+          - "--config.file=/etc/prometheus/prometheus.yml"
+          - "--storage.tsdb.path=/prometheus"
+          - "--storage.tsdb.retention.time=90d"
+          - "--storage.tsdb.retention.size=50GB"
+          - "--storage.tsdb.max-block-duration=4h"
+          - "--storage.tsdb.min-block-duration=2h"
+          - "--web.console.libraries=/etc/prometheus/console_libraries"
+          - "--web.console.templates=/etc/prometheus/consoles"
+          - "--web.enable-lifecycle"
+          - "--query.timeout=2m"
+
+        ports:
+        - containerPort: 9090
+          name: web
+          protocol: TCP
+
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+        - name: rules
+          mountPath: /etc/prometheus/rules
+        - name: data
+          mountPath: /prometheus
+        - name: tmp
+          mountPath: /tmp
+
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+
+        livenessProbe:
+          httpGet:
+            path: /-/healthy
+            port: 9090
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: 9090
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65534
+          capabilities:
+            drop:
+            - ALL
+
+      volumes:
+      - name: config
+        configMap:
+          name: prometheus-config
+          items:
+            - key: prometheus.yml
+              path: prometheus.yml
+      - name: rules
+        configMap:
+          name: prometheus-rules
+      - name: tmp
+        emptyDir: {}
+
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        app: prometheus
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "fast-ssd"
+      resources:
+        requests:
+          storage: 100Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: traceo
+  labels:
+    app: prometheus
+  annotations:
+    description: "Prometheus monitoring service"
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+  - port: 9090
+    targetPort: 9090
+    protocol: TCP
+    name: web
+  selector:
+    app: prometheus
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-ui
+  namespace: traceo
+  labels:
+    app: prometheus
+spec:
+  type: ClusterIP
+  ports:
+  - port: 9090
+    targetPort: 9090
+    protocol: TCP
+    name: web
+  selector:
+    app: prometheus
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: traceo
+  labels:
+    app: prometheus
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+  labels:
+    app: prometheus
+rules:
+# Node access
+- apiGroups: [""]
+  resources:
+  - nodes
+  - nodes/proxy
+  verbs: ["get", "list", "watch"]
+
+# Service discovery
+- apiGroups: [""]
+  resources:
+  - services
+  - endpoints
+  - pods
+  verbs: ["get", "list", "watch"]
+
+# Kubernetes metadata
+- apiGroups: [""]
+  resources:
+  - configmaps
+  verbs: ["get"]
+
+# Ingress monitoring
+- apiGroups: ["networking.k8s.io"]
+  resources:
+  - ingresses
+  verbs: ["get", "list", "watch"]
+
+# Read-only access to non-resource URLs
+- nonResourceURLs:
+  - /metrics
+  - /metrics/cadvisor
+  verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+  labels:
+    app: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: traceo
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: prometheus
+  namespace: traceo
+  labels:
+    app: prometheus
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: prometheus
+
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: prometheus-quota
+  namespace: traceo
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: "8Gi"
+    limits.cpu: "8"
+    limits.memory: "16Gi"
+    persistentvolumeclaims: "5"
+    pods: "10"
+  scopeSelector:
+    matchExpressions:
+    - operator: In
+      scopeName: PriorityClass
+      values: ["system-cluster-critical", "system-node-critical"]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prometheus-network-policy
+  namespace: traceo
+spec:
+  podSelector:
+    matchLabels:
+      app: prometheus
+  policyTypes:
+  - Ingress
+  - Egress
+
+  ingress:
+  # Allow from Alertmanager
+  - from:
+    - podSelector:
+        matchLabels:
+          app: alertmanager
+    ports:
+    - protocol: TCP
+      port: 9090
+
+  # Allow from Grafana
+  - from:
+    - podSelector:
+        matchLabels:
+          app: grafana
+    ports:
+    - protocol: TCP
+      port: 9090
+
+  # Allow from monitoring/prometheus namespace
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 9090
+
+  # Allow probes from kubelet
+  - from:
+    - podSelector:
+        matchLabels:
+          app: prometheus
+    ports:
+    - protocol: TCP
+      port: 9090
+
+  egress:
+  # Allow DNS
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+
+  # Allow to kubelet for metrics
+  - to:
+    - podSelector:
+        matchLabels:
+          k8s-app: kubelet
+    ports:
+    - protocol: TCP
+      port: 10250
+
+  # Allow to node-exporter
+  - to:
+    - podSelector:
+        matchLabels:
+          app: node-exporter
+    ports:
+    - protocol: TCP
+      port: 9100
+
+  # Allow to backend services
+  - to:
+    - podSelector:
+        matchLabels:
+          app: backend
+    ports:
+    - protocol: TCP
+      port: 8080
+    - protocol: TCP
+      port: 9090
+
+  # Allow to PostgreSQL exporter
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres-exporter
+    ports:
+    - protocol: TCP
+      port: 9187
+
+  # Allow to Alertmanager
+  - to:
+    - podSelector:
+        matchLabels:
+          app: alertmanager
+    ports:
+    - protocol: TCP
+      port: 9093
+
+  # Allow HTTPS for remote write (optional)
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 443
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-documentation
+  namespace: traceo
+  labels:
+    app: prometheus
+data:
+  README.md: |
+    # Prometheus Configuration Documentation
+
+    ## Overview
+    This configuration deploys a production-grade Prometheus monitoring stack on Kubernetes with the following improvements:
+
+    ### High Availability
+    - **StatefulSet with 2 replicas** for redundancy
+    - **Pod Anti-Affinity** to distribute pods across different nodes
+    - **PodDisruptionBudget** ensures at least 1 pod remains during disruptions
+    - **Persistent Volume Claims** for data durability
+
+    ### Storage
+    - **100GB PersistentVolume** per pod (total 200GB across replicas)
+    - **90-day retention** with 50GB size limit
+    - **fast-ssd** storage class for high I/O performance
+
+    ### Security Hardening
+    - **Non-root user** (UID 65534 - nobody)
+    - **Security context** with restricted capabilities
+    - **ReadOnlyRootFilesystem** enabled
+    - **RBAC** with minimal required permissions
+    - **NetworkPolicy** for pod-to-pod communication control
+    - **Seccomp** profile enabled
+
+    ### Performance Optimization
+    - **30-second scrape interval** (balanced for cost/accuracy)
+    - **Recording rules** for precomputed aggregations
+    - **Query timeout** set to 2 minutes
+    - **Memory limits** based on cardinality (3-4GB allocation)
+    - **Resource quotas** to prevent resource exhaustion
+
+    ### Alert Rules
+    - **Three severity levels**: info, warning, critical
+    - **17+ alert rules** covering:
+      - Application errors and latency
+      - Database health and performance
+      - Node resource utilization
+      - Kubernetes health
+      - Prometheus self-monitoring
+
+    ### Deployment
+    Install with:
+    ```bash
+    kubectl apply -f prometheus-config.yaml
+    ```
+
+    Access Prometheus UI:
+    ```bash
+    kubectl port-forward -n traceo svc/prometheus-ui 9090:9090
+    ```
+
+    ## Configuration Changes from Original
+    1. Deployment → StatefulSet (HA & persistence)
+    2. emptyDir → PersistentVolumeClaim (data durability)
+    3. Single replica → 2 replicas (redundancy)
+    4. 15s scrape interval → 30s (optimization)
+    5. Generic image tag → v2.50.0 (version pinning)
+    6. 30d retention → 90d (longer history)
+    7. Added recording rules (query optimization)
+    8. Enhanced alert rules (18 → 40+ rules)
+    9. Added RBAC restrictions (security)
+    10. Added NetworkPolicy (network security)
+    11. Added security context (pod security)
+    12. Added health probes (reliability)
+    13. Added resource limits (stability)

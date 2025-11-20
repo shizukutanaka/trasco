@@ -1,0 +1,422 @@
+###############################################################################
+# Prometheus Operator CRDs and ServiceMonitor Configuration
+#
+# This file defines Kubernetes-native monitoring resources using
+# Prometheus Operator (github.com/prometheus-operator/prometheus-operator)
+#
+# Benefits:
+# - Declarative configuration management
+# - Automatic Prometheus configuration updates
+# - Better integration with GitOps workflows
+# - Custom Resource Definitions for monitoring
+###############################################################################
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: prometheus-slo-alerts
+  namespace: traceo
+  labels:
+    app: prometheus
+    prometheus: prometheus
+spec:
+  groups:
+    - name: slo_alerts
+      interval: 30s
+      rules:
+        # ===================================================================
+        # Multi-Window Multi-Burn-Rate (MWMB) Alerts
+        # SLO: 99.9% availability
+        # Error Budget: 0.1% (43.2 seconds per 12 hour window)
+        # ===================================================================
+
+        # ALERT 1: Short window, high burn rate (5m + 1h)
+        # Burns 14.4% of error budget in 5 minutes
+        # Paging alert - immediate action required
+        - alert: SLOAPIGatewayHighErrorRatePage1h
+          expr: |
+            (
+              max(slo:api_gateway:error_ratio:rate5m_burn) > 0.144
+              and
+              max(slo:api_gateway:error_ratio:rate1h_burn) > 0.144
+            )
+          for: 2m
+          labels:
+            severity: critical
+            alert_type: slo_page
+            slo_window: "1h"
+            burn_rate: "14.4x"
+            team: backend
+          annotations:
+            summary: "SLO ERROR BUDGET BURN RATE CRITICAL (14.4x) - 1h window"
+            description: |
+              API Gateway error rate is {{ $value | humanizePercentage }}.
+              5m burn: {{ $value }}% (threshold: 14.4%)
+              1h burn: {{ (max over (1h) (slo:api_gateway:error_ratio:rate1h_burn)) }}%
+
+              ERROR BUDGET CONSUMED:
+              - In 1 hour: 2% of monthly budget
+              - In 4.2 hours: 8.4% of monthly budget (within typical incident response)
+
+              ACTION: Immediately investigate error spike. Check:
+              1. Application error logs
+              2. Database connectivity
+              3. External service dependencies
+              4. Recent deployments
+            runbook: "https://wiki.example.com/runbooks/api-gateway-errors"
+            dashboard: "http://grafana:3000/d/api-gateway-slo"
+
+        # ALERT 2: Longer window, medium burn rate (30m + 6h)
+        # Burns 6% of error budget
+        # Paging alert - service degradation
+        - alert: SLOAPIGatewayHighErrorRatePage6h
+          expr: |
+            (
+              max(slo:api_gateway:error_ratio:rate30m_burn) > 0.06
+              and
+              max(slo:api_gateway:error_ratio:rate6h_burn) > 0.06
+            )
+          for: 5m
+          labels:
+            severity: critical
+            alert_type: slo_page
+            slo_window: "6h"
+            burn_rate: "6x"
+            team: backend
+          annotations:
+            summary: "SLO ERROR BUDGET BURN RATE HIGH (6x) - 6h window"
+            description: |
+              API Gateway error rate is {{ $value | humanizePercentage }}.
+              30m burn: {{ $value }}% (threshold: 6%)
+              6h burn: {{ (max over (6h) (slo:api_gateway:error_ratio:rate6h_burn)) }}%
+
+              This indicates a sustained degradation over hours.
+              ACTION: Begin incident investigation, gather team
+
+        # ALERT 3: Longer window, lower burn rate (2h + 1d)
+        # Burns 3% of error budget
+        # Ticket alert - operational issue
+        - alert: SLOAPIGatewayHighErrorRateTicket1d
+          expr: |
+            (
+              max(slo:api_gateway:error_ratio:rate2h_burn) > 0.03
+              and
+              max(slo:api_gateway:error_ratio:rate1d_burn) > 0.03
+            )
+          for: 15m
+          labels:
+            severity: warning
+            alert_type: slo_ticket
+            slo_window: "1d"
+            burn_rate: "3x"
+            team: backend
+          annotations:
+            summary: "SLO ERROR BUDGET BURN RATE ELEVATED (3x) - 1d window"
+            description: |
+              API Gateway error rate is {{ $value | humanizePercentage }}.
+
+              Sustained error rate over 24 hours. This will consume error budget
+              across multiple days if not addressed.
+
+              ACTION: Create ticket for investigation and optimization
+
+        # ALERT 4: Very long window, low burn rate (6h + 3d)
+        # Burns exactly 1% of error budget
+        # Ticket alert - capacity planning
+        - alert: SLOAPIGatewayHighErrorRateTicket3d
+          expr: |
+            (
+              max(slo:api_gateway:error_ratio:rate6h_burn_long) > 0.01
+              and
+              max(slo:api_gateway:error_ratio:rate3d_burn) > 0.01
+            )
+          for: 30m
+          labels:
+            severity: warning
+            alert_type: slo_ticket
+            slo_window: "3d"
+            burn_rate: "1x"
+            team: backend
+          annotations:
+            summary: "SLO ERROR BUDGET BURN RATE NORMAL (1x) - 3d window"
+            description: |
+              API Gateway error rate is consuming error budget at exactly 1x rate
+              over a 3-day window. While this is expected variation, continued
+              trends suggest capacity or reliability issues.
+
+              ACTION: Plan optimization for next sprint
+
+        # ===================================================================
+        # High Latency SLO Alerts
+        # SLO: 99.9% of requests < 1s (p99)
+        # ===================================================================
+
+        - alert: SLOAPIGatewayHighLatencyPage
+          expr: |
+            (
+              max(slo:api_gateway:latency:p99_5m) > 1
+              and
+              max(slo:api_gateway:latency:p99_5m offset 1h) > 1
+            )
+          for: 3m
+          labels:
+            severity: critical
+            alert_type: slo_page
+            team: backend
+          annotations:
+            summary: "SLO: API Gateway p99 latency > 1s"
+            description: |
+              API Gateway p99 latency is {{ $value }}s (threshold: 1s)
+
+              This indicates 1% of requests are slower than acceptable.
+              ACTION: Check for slow database queries, external API latency
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: prometheus-api-gateway
+  namespace: traceo
+  labels:
+    app: prometheus
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: api-gateway
+  namespaceSelector:
+    matchNames:
+      - traceo
+  endpoints:
+    - port: metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      path: /metrics
+      scheme: http
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: prometheus-database
+  namespace: traceo
+  labels:
+    app: prometheus
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: postgresql
+  namespaceSelector:
+    matchNames:
+      - traceo
+  endpoints:
+    - port: metrics
+      interval: 30s
+      scrapeTimeout: 10s
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: prometheus-redis
+  namespace: traceo
+  labels:
+    app: prometheus
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: redis
+  namespaceSelector:
+    matchNames:
+      - traceo
+  endpoints:
+    - port: metrics
+      interval: 30s
+      scrapeTimeout: 10s
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kube-state-metrics
+  namespace: monitoring
+  labels:
+    app: kube-state-metrics
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kube-state-metrics
+  namespaceSelector:
+    matchNames:
+      - monitoring
+  endpoints:
+    - port: metrics
+      interval: 30s
+      scrapeTimeout: 10s
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: node-exporter
+  namespace: monitoring
+  labels:
+    app: node-exporter
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: node-exporter
+  namespaceSelector:
+    matchNames:
+      - monitoring
+  endpoints:
+    - port: metrics
+      interval: 60s
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+
+---
+# PrometheusRule for cardinality management and metric quality
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: prometheus-health
+  namespace: traceo
+spec:
+  groups:
+    - name: prometheus_health
+      interval: 30s
+      rules:
+        # Cardinality alerts
+        - alert: PrometheusHighCardinality
+          expr: |
+            count({__name__=~".+"}) > 10000000
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Prometheus cardinality is high"
+            description: "Cardinality: {{ $value }} (threshold: 10M)"
+
+        # High series churn (metric explosion)
+        - alert: PrometheusHighSeriesChurn
+          expr: |
+            rate(prometheus_tsdb_symbol_table_size_bytes[5m]) > 1000000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Prometheus series churn is high"
+            description: "Series churn rate: {{ $value }} bytes/sec"
+
+        # WAL size alerts
+        - alert: PrometheusHighWALSize
+          expr: |
+            prometheus_tsdb_wal_segment_current_size > 2147483648  # 2GB
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Prometheus WAL size is high"
+            description: "WAL size: {{ $value | humanize }}B"
+
+        # Query load
+        - alert: PrometheusHighQueryLoad
+          expr: |
+            rate(prometheus_engine_queries[5m]) > 100
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Prometheus query load is high"
+            description: "Query rate: {{ $value }} queries/sec"
+
+        # Remote write queue
+        - alert: PrometheusRemoteWriteBacklog
+          expr: |
+            min_over_time(prometheus_remote_storage_samples_total[5m]) == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Prometheus remote write is failing"
+            description: "No samples sent to remote storage in 5 minutes"
+
+---
+# Cardinality Management Tool - Custom metrics for monitoring
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-cardinality-config
+  namespace: traceo
+spec:
+  analyze-cardinality.sh: |
+    #!/bin/bash
+    # Script to analyze Prometheus cardinality and identify problematic metrics
+
+    PROMETHEUS_URL="${PROMETHEUS_URL:-http://prometheus:9090}"
+
+    echo "=== Top 20 Metrics by Cardinality ==="
+    curl -s "${PROMETHEUS_URL}/api/v1/query?query=topk(20,count(%7B__name__%3D~%22.%2B%22%7D))" | \
+      jq '.data.result[] | {metric: .__name__, cardinality: .value[1]}' | sort -k2 -rn
+
+    echo ""
+    echo "=== High Cardinality Labels ==="
+    curl -s "${PROMETHEUS_URL}/api/v1/query?query=topk(10,count(count%20by%20(label_name)(%7B__name__%3D~%22.%2B%22%7D)))" | \
+      jq '.data.result[]'
+
+    echo ""
+    echo "=== Metrics with High Label Cardinality ==="
+    # Find metrics where a single label has many unique values
+    curl -s "${PROMETHEUS_URL}/api/v1/label/__name__/values" | \
+      jq -r '.data[]' | while read metric; do
+        count=$(curl -s "${PROMETHEUS_URL}/api/v1/query?query=count(%7B__name__%3D%22${metric}%22%7D)" | jq '.data.result[0].value[1]' 2>/dev/null || echo "0")
+        if [ "$count" -gt 10000 ]; then
+          echo "${metric}: ${count} series"
+        fi
+      done | sort -t: -k2 -rn | head -20
+
+---
+# Service for Prometheus metrics endpoint
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-metrics
+  namespace: traceo
+  labels:
+    app: prometheus
+spec:
+  type: ClusterIP
+  ports:
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+  selector:
+    app: prometheus
+
+---
+# PodMonitor for monitoring Prometheus itself
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: prometheus-self-monitoring
+  namespace: traceo
+  labels:
+    app: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: prometheus
+  podMetricsEndpoints:
+    - port: web
+      interval: 15s
+      scrapeTimeout: 10s
+      path: /metrics
