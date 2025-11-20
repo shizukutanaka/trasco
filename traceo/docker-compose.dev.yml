@@ -1,0 +1,170 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: traceo_db_dev
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-traceo}
+      POSTGRES_USER: ${POSTGRES_USER:-traceo_dev}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-traceo_dev_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-traceo_dev}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - traceo_dev
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: traceo_pgadmin_dev
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@traceo.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: 'False'
+      PGADMIN_CONFIG_CONSOLE_LOG_LEVEL: 10
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - pgadmin_data_dev:/var/lib/pgadmin
+    networks:
+      - traceo_dev
+    profiles:
+      - tools
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: traceo_backend_dev
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-traceo_dev}:${POSTGRES_PASSWORD:-traceo_dev_password}@postgres:5432/${POSTGRES_DB:-traceo}
+      PYTHONUNBUFFERED: 1
+      DEBUG: "true"
+      LOG_LEVEL: DEBUG
+      IMAP_SERVER: ${IMAP_SERVER:-}
+      IMAP_USER: ${IMAP_USER:-}
+      IMAP_PASSWORD: ${IMAP_PASSWORD:-}
+      SMTP_SERVER: ${SMTP_SERVER:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      GEOIP_DB_PATH: ${GEOIP_DB_PATH:-/app/data/GeoLite2-City.mmdb}
+      IPINFO_API_KEY: ${IPINFO_API_KEY:-}
+      ABUSEIPDB_API_KEY: ${ABUSEIPDB_API_KEY:-}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - ./backend/data:/app/data
+      - /app/__pycache__
+    command: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - traceo_dev
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: traceo_frontend_dev
+    environment:
+      REACT_APP_API_BASE_URL: ${REACT_APP_API_BASE_URL:-http://localhost:8000}
+      REACT_APP_DEBUG: "true"
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+      - /app/node_modules
+    command: npm start
+    networks:
+      - traceo_dev
+    stdin_open: true
+    tty: true
+
+  redis:
+    image: redis:7-alpine
+    container_name: traceo_redis_dev
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data_dev:/data
+    networks:
+      - traceo_dev
+    profiles:
+      - tools
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Optional: Adminer for quick database access
+  adminer:
+    image: adminer:latest
+    container_name: traceo_adminer_dev
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - traceo_dev
+    profiles:
+      - tools
+
+  # Optional: API documentation viewer
+  swagger-ui:
+    image: swaggerapi/swagger-ui:latest
+    container_name: traceo_swagger_dev
+    environment:
+      SWAGGER_JSON: /openapi.json
+      BASE_URL: /api-docs
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./backend/openapi.json:/openapi.json
+    depends_on:
+      - backend
+    networks:
+      - traceo_dev
+    profiles:
+      - docs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  postgres_data_dev:
+    name: traceo_postgres_dev
+  pgadmin_data_dev:
+    name: traceo_pgadmin_dev
+  redis_data_dev:
+    name: traceo_redis_dev
+
+networks:
+  traceo_dev:
+    name: traceo_dev
+    driver: bridge

@@ -1,0 +1,661 @@
+###############################################################################
+# Multi-Cluster Prometheus Monitoring Configuration
+#
+# Implements advanced multi-cluster patterns with:
+# - Prometheus Agent Mode (lightweight edge scraping)
+# - Centralized Mimir for deduplication
+# - Cross-cluster querying
+# - Federated alerting
+#
+# Research sources:
+# - Thanos multi-cluster documentation
+# - Mimir HA patterns (1B+ series)
+# - Prometheus Agent mode best practices
+# - CNCF multi-cluster observability standards
+###############################################################################
+
+---
+## ============================================================================
+## EDGE CLUSTER CONFIGURATION (Lightweight Agent Mode)
+## ============================================================================
+## Deploy on each edge/regional cluster to scrape local metrics
+## Forward to central Mimir for aggregation and deduplication
+## ============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-agent-config
+  namespace: monitoring
+  labels:
+    app: prometheus-agent
+    cluster: edge-regional
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      scrape_timeout: 10s
+      evaluation_interval: 30s
+
+      external_labels:
+        cluster: '{{ CLUSTER_NAME }}'     # Edge cluster name (e.g., us-west-1)
+        region: '{{ REGION }}'            # Geographic region
+        environment: 'production'
+        agent: 'prometheus-agent'         # Identifies as agent, not full Prometheus
+
+    # No local alerting in agent mode
+    # Alerts handled centrally in hub cluster
+
+    rule_files: []  # No local rules in agent mode
+
+    # Remote write to central Mimir (high throughput)
+    remote_write:
+      - url: "https://mimir-distributor.central-monitoring:8080/api/v1/push"
+
+        # Use X.509 client certificate for mTLS
+        tls_config:
+          ca_file: /etc/prometheus/tls/ca.crt
+          cert_file: /etc/prometheus/tls/client.crt
+          key_file: /etc/prometheus/tls/client.key
+          server_name: mimir-distributor.central-monitoring
+
+        # OAuth2 bearer token (alternative to mTLS)
+        bearer_token_file: /var/run/secrets/oauth2/token
+
+        # Queue configuration for high reliability
+        queue_config:
+          capacity: 50000              # Larger queue for edge clusters
+          max_shards: 500
+          min_shards: 10
+          max_samples_per_send: 10000
+          batch_send_deadline: 10s
+          min_backoff: 100ms
+          max_backoff: 30s
+          # Retry on temporary failures
+          retry_on_http_429: true
+          max_retries: 3
+
+        # Write relabel config for cardinality control
+        write_relabel_configs:
+          # Drop internal Go metrics (not needed for business SLI)
+          - source_labels: [__name__]
+            regex: 'go_.*|process_.*|promhttp_.*'
+            action: drop
+
+          # Drop debug-level metrics
+          - source_labels: [__name__]
+            regex: 'debug_.*|test_.*'
+            action: drop
+
+          # Keep only essential application metrics
+          - source_labels: [__name__]
+            regex: '^(http_|grpc_|db_|cache_|job_|kubernetes_|node_|container_)'
+            action: keep
+
+        # Metadata configuration (reduce overhead)
+        metadata_config:
+          send: true
+          send_interval: 5m
+
+    # Scrape configurations for edge cluster
+    scrape_configs:
+      # Kubernetes API Server
+      - job_name: 'kubernetes-apiservers'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names:
+                - default
+
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_name]
+            action: keep
+            regex: 'kubernetes'
+          - source_labels: [__meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: 'https'
+
+      # kube-state-metrics (pod/deployment/node state)
+      - job_name: 'kube-state-metrics'
+        scrape_interval: 30s
+        honor_labels: true
+
+        kubernetes_sd_configs:
+          - role: service
+            namespaces:
+              names:
+                - monitoring
+
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_label_app_kubernetes_io_name]
+            action: keep
+            regex: 'kube-state-metrics'
+          - source_labels: [__meta_kubernetes_service_port_name]
+            action: keep
+            regex: 'metrics'
+
+        metric_relabel_configs:
+          # Keep only essential kube-state metrics
+          - source_labels: [__name__]
+            regex: 'kube_(pod_status_phase|deployment_status_replicas|node_status_condition|persistentvolumeclaim_status_phase)'
+            action: keep
+
+      # Node exporter (infrastructure metrics)
+      - job_name: 'node-exporter'
+        scrape_interval: 60s  # Lower frequency for edge clusters
+
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names:
+                - monitoring
+
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_label_app]
+            action: keep
+            regex: 'node-exporter'
+
+        metric_relabel_configs:
+          - source_labels: [__name__]
+            regex: 'node_(cpu_seconds_total|memory_MemAvailable_bytes|disk_.*|network_.*|load_average.*|uname_info)'
+            action: keep
+
+      # Application services (pod discovery)
+      - job_name: 'application-services'
+        scrape_interval: 30s
+
+        kubernetes_sd_configs:
+          - role: pod
+
+        relabel_configs:
+          # Only scrape pods with prometheus annotation
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: 'true'
+
+          # Use custom port if specified
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            target_label: __address__
+            regex: ([^:]+)(?::\d+)?:(.+)
+            replacement: ${1}:${2}
+
+          # Use custom path if specified
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+
+          # Add standard labels
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: app
+
+        # Cardinality protection
+        sample_limit: 100000
+        label_limit: 50
+
+---
+## ============================================================================
+## CENTRAL HUB CLUSTER CONFIGURATION (Full Prometheus + Mimir)
+## ============================================================================
+## Aggregates and deduplicates metrics from all edge clusters
+## Handles alerting and long-term storage
+## ============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-hub-config
+  namespace: monitoring
+  labels:
+    app: prometheus-hub
+    cluster: central-hub
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      scrape_timeout: 10s
+      evaluation_interval: 30s
+
+      external_labels:
+        cluster: 'central-hub'
+        environment: 'production'
+        monitoring_role: 'hub'
+
+    # Alertmanager configuration (centralized)
+    alerting:
+      alert_relabel_configs:
+        # Add cluster label from external label
+        - source_labels: [__labels_cluster]
+          target_label: cluster
+
+      alertmanagers:
+        - kubernetes_sd_configs:
+          - role: service
+            namespaces:
+              names:
+                - monitoring
+
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_service_name]
+              action: keep
+              regex: 'alertmanager'
+
+    rule_files:
+      - '/etc/prometheus/rules/central-alert-rules.yml'
+      - '/etc/prometheus/rules/slo-rules.yml'
+
+    # Remote write to Mimir for long-term storage
+    remote_write:
+      - url: "https://mimir-distributor.monitoring:8080/api/v1/push"
+        tls_config:
+          ca_file: /etc/prometheus/tls/ca.crt
+
+        queue_config:
+          capacity: 50000
+          max_shards: 500
+          min_shards: 10
+          max_samples_per_send: 10000
+          batch_send_deadline: 10s
+
+        write_relabel_configs:
+          - source_labels: [__name__]
+            regex: 'go_.*|process_.*'
+            action: drop
+
+    # Scrape configurations for hub
+    scrape_configs:
+      # Prometheus self-monitoring
+      - job_name: 'prometheus-hub'
+        static_configs:
+          - targets: ['localhost:9090']
+
+      # Mimir metrics
+      - job_name: 'mimir'
+        static_configs:
+          - targets: ['mimir-distributor:8080']
+
+      # Central cluster infrastructure
+      - job_name: 'central-infrastructure'
+        kubernetes_sd_configs:
+          - role: node
+
+        relabel_configs:
+          - source_labels: [__address__]
+            regex: '([^:]+)(?::\d+)?'
+            replacement: '${1}:9100'
+            target_label: __address__
+
+      # Cross-cluster health checks (scrape edge cluster agents)
+      - job_name: 'edge-cluster-health'
+        scrape_interval: 2m  # Lower frequency for cross-cluster
+
+        kubernetes_sd_configs:
+          - role: service
+            namespaces:
+              names:
+                - monitoring
+
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_annotation_edge_cluster]
+            action: keep
+            regex: 'true'
+
+---
+## ============================================================================
+## MIMIR DISTRIBUTOR CONFIGURATION (Central Deduplication & Storage)
+## ============================================================================
+## High-performance distributor for handling multi-cluster metrics
+## ============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mimir-distributor-config
+  namespace: monitoring
+spec:
+  distributor.yaml: |
+    # Distributor configuration for Mimir
+
+    # HA Samples handling (deduplication)
+    limits:
+      # Accept high-availability samples from replica Prometheus
+      accept_ha_samples: true
+
+      # Label used for HA cluster identification
+      ha_cluster_label: cluster
+
+      # Label used for HA replica identification
+      ha_replica_label: __replica__
+
+      # Enable deduplication
+      ha_max_clusters: 1000
+
+      # Per-user series limits (adjust based on load)
+      max_series_per_user: 100000
+      max_global_series_per_user: 1000000000  # 1B series limit
+
+      # Per-user metric limits
+      max_exemplars_per_user: 100000
+
+      # Cardinality limits
+      max_label_names_per_series: 50
+      max_label_name_length: 128
+      max_label_value_length: 256
+
+    # Ingest rate limits
+    rate_limit_enabled: true
+    rate_limit_strategies:
+      - strategy: dynamic
+        burst: 10000
+        rate: 5000
+
+    # TLS and authentication
+    server:
+      http_tls_config:
+        enabled: true
+        cert_file: /etc/mimir/tls/server.crt
+        key_file: /etc/mimir/tls/server.key
+        client_auth_type: RequireAndVerifyClientCert
+        client_ca_file: /etc/mimir/tls/ca.crt
+
+    # Rate limiting per tenants
+    tenant_rate_limit:
+      num_streams: 10000
+      bytes_per_second: 1000000  # 1MB/s per tenant
+
+---
+## ============================================================================
+## PROMETHEUS AGENT MODE DEPLOYMENT (Edge Clusters)
+## ============================================================================
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: prometheus-agent
+  namespace: monitoring
+  labels:
+    app: prometheus-agent
+    cluster: edge
+spec:
+  serviceName: prometheus-agent
+  replicas: 2  # HA pair in each edge cluster
+
+  selector:
+    matchLabels:
+      app: prometheus-agent
+
+  template:
+    metadata:
+      labels:
+        app: prometheus-agent
+        cluster: edge
+
+    spec:
+      serviceAccountName: prometheus-agent
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+
+      # Prefer local node for edge clusters
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: [prometheus-agent]
+                topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v2.50.0
+        imagePullPolicy: IfNotPresent
+
+        # Agent mode - no local storage, minimal memory
+        args:
+          - "--config.file=/etc/prometheus/prometheus.yml"
+          - "--enable-feature=agent"  # Agent mode
+          - "--storage.agent.path=/prometheus"
+          - "--web.listen-address=:9090"
+
+        ports:
+        - containerPort: 9090
+          name: web
+
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+        - name: agent-storage
+          mountPath: /prometheus
+        - name: tls
+          mountPath: /etc/prometheus/tls
+          readOnly: true
+        - name: oauth2
+          mountPath: /var/run/secrets/oauth2
+          readOnly: true
+
+        # Minimal resource requirements for agent
+        resources:
+          requests:
+            cpu: 100m
+            memory: 512Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+
+        livenessProbe:
+          httpGet:
+            path: /-/healthy
+            port: 9090
+          initialDelaySeconds: 30
+          periodSeconds: 30
+
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: 9090
+          initialDelaySeconds: 10
+          periodSeconds: 15
+
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+
+      volumes:
+      - name: config
+        configMap:
+          name: prometheus-agent-config
+      - name: tls
+        secret:
+          secretName: prometheus-agent-tls
+      - name: oauth2
+        secret:
+          secretName: prometheus-oauth2
+      - name: agent-storage
+        emptyDir:
+          sizeLimit: 2Gi  # Minimal local storage for agent
+
+---
+## ============================================================================
+## MIMIR DEPLOYMENT (Central Hub)
+## ============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mimir-config
+  namespace: monitoring
+  labels:
+    app: mimir
+    component: distributor
+data:
+  mimir.yaml: |
+    # Mimir configuration for receiving metrics from multiple clusters
+
+    # Multi-tenancy
+    auth_enabled: true
+
+    ingester:
+      max_series_per_metric: 100000
+      max_global_series_per_metric: 1000000000
+
+      lifecycler:
+        ring:
+          kvstore:
+            store: memberlist
+          replication_factor: 3
+
+    distributor:
+      ring:
+        kvstore:
+          store: memberlist
+
+    # Blocks storage
+    blocks_storage:
+      backend: s3
+      s3:
+        bucket_name: mimir-blocks
+        endpoint: s3.amazonaws.com
+        region: us-east-1
+
+      tsdb:
+        dir: /data/tsdb
+        block_ranges_period: [2h, 12h, 24h]
+
+    # Querier for cross-cluster queries
+    querier:
+      max_concurrent: 100
+      timeout: 2m
+
+    # Alerting
+    alertmanager:
+      enable_api: true
+
+    # Runtime configuration
+    runtime_config:
+      file: /etc/mimir/runtime.yaml
+      period: 10s
+
+---
+## ============================================================================
+## SERVICE DISCOVERY FOR MULTI-CLUSTER
+## ============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-agent
+  namespace: monitoring
+  labels:
+    app: prometheus-agent
+spec:
+  clusterIP: None  # Headless service
+  ports:
+  - port: 9090
+    name: metrics
+  selector:
+    app: prometheus-agent
+
+---
+## ============================================================================
+## FEDERATION RULES (Hub Cluster)
+## ============================================================================
+## Pre-aggregate metrics from edge clusters for faster querying
+## ============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: central-alert-rules
+  namespace: monitoring
+data:
+  central-rules.yml: |
+    groups:
+      - name: multi_cluster_federation
+        interval: 30s
+        rules:
+          # Aggregate metrics across all clusters
+          - record: cluster:http_requests:rate5m
+            expr: sum(http_requests_total) by (cluster, job, method, status)
+
+          - record: cluster:http_request_duration:p99
+            expr: |
+              histogram_quantile(0.99,
+                sum(rate(http_request_duration_seconds_bucket[5m])) by (cluster, job, le)
+              )
+
+          - record: cluster:error_rate:5m
+            expr: |
+              sum(rate(http_requests_total{status=~"5.."}[5m])) by (cluster, job)
+              /
+              sum(rate(http_requests_total[5m])) by (cluster, job)
+
+          # Cross-cluster SLO tracking
+          - record: slo:cross_cluster:availability
+            expr: |
+              (
+                sum(cluster:http_requests:rate5m) by (cluster)
+                -
+                sum(rate(http_requests_total{status=~"5.."}[5m])) by (cluster)
+              )
+              /
+              sum(cluster:http_requests:rate5m) by (cluster)
+
+          # Region aggregation
+          - record: region:cpu_usage:percentage
+            expr: avg(node_cpu_seconds_total{mode!="idle"}) by (region)
+
+          - record: region:memory_usage:percentage
+            expr: avg(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) by (region)
+
+      - name: multi_cluster_alerts
+        interval: 30s
+        rules:
+          # Global error rate alert
+          - alert: GlobalHighErrorRate
+            expr: cluster:error_rate:5m > 0.05
+            for: 5m
+            labels:
+              severity: warning
+              scope: global
+            annotations:
+              summary: "High error rate in cluster {{ $labels.cluster }}"
+              description: "Error rate: {{ $value | humanizePercentage }}"
+
+          # Cross-cluster latency alert
+          - alert: GlobalHighLatency
+            expr: cluster:http_request_duration:p99 > 2
+            for: 5m
+            labels:
+              severity: warning
+              scope: global
+            annotations:
+              summary: "High latency in cluster {{ $labels.cluster }}"
+              description: "p99 latency: {{ $value }}s"
+
+          # Regional availability alert
+          - alert: RegionalAvailabilityDegraded
+            expr: slo:cross_cluster:availability < 0.999
+            for: 10m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Regional availability below SLO"
+              description: "Region: {{ $labels.cluster }}, Availability: {{ $value }}"

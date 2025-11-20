@@ -1,0 +1,297 @@
+.email-list-container {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  background: white;
+  padding: 20px;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.email-list-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.email-list-header h2 {
+  margin: 0;
+  font-size: 24px;
+  color: #333;
+}
+
+.btn-refresh {
+  background: #2196F3;
+  color: white;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 16px;
+  transition: background 0.3s;
+}
+
+.btn-refresh:hover:not(:disabled) {
+  background: #1976D2;
+}
+
+.btn-refresh:disabled {
+  background: #ccc;
+  cursor: not-allowed;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+.email-list-controls {
+  display: flex;
+  gap: 15px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.search-box {
+  position: relative;
+  flex: 1;
+  min-width: 200px;
+}
+
+.search-input {
+  width: 100%;
+  padding: 10px 35px 10px 15px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 14px;
+  transition: border-color 0.3s;
+}
+
+.search-input:focus {
+  outline: none;
+  border-color: #2196F3;
+  box-shadow: 0 0 0 2px rgba(33, 150, 243, 0.1);
+}
+
+.search-icon {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #999;
+}
+
+.filter-controls {
+  display: flex;
+  gap: 10px;
+}
+
+.select-control {
+  padding: 10px 12px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 14px;
+  background: white;
+  cursor: pointer;
+  transition: border-color 0.3s;
+}
+
+.select-control:hover {
+  border-color: #2196F3;
+}
+
+.select-control:focus {
+  outline: none;
+  border-color: #2196F3;
+  box-shadow: 0 0 0 2px rgba(33, 150, 243, 0.1);
+}
+
+.email-count {
+  color: #666;
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+.email-list-empty {
+  text-align: center;
+  padding: 40px 20px;
+  color: #999;
+}
+
+.email-list-empty p {
+  margin: 0;
+  font-size: 16px;
+}
+
+.email-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.email-table thead {
+  background: #f5f5f5;
+  border-bottom: 2px solid #ddd;
+}
+
+.email-table th {
+  padding: 12px;
+  text-align: left;
+  font-weight: 600;
+  color: #333;
+}
+
+.email-table tbody tr {
+  border-bottom: 1px solid #eee;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.email-table tbody tr:hover {
+  background: #f9f9f9;
+}
+
+.email-table td {
+  padding: 12px;
+}
+
+.cell-sender {
+  font-weight: 500;
+  color: #2196F3;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cell-subject {
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #333;
+}
+
+.cell-date {
+  color: #666;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.cell-score {
+  text-align: center;
+}
+
+.risk-badge {
+  display: inline-block;
+  padding: 6px 12px;
+  border-radius: 20px;
+  font-weight: 600;
+  color: white;
+  min-width: 80px;
+  text-align: center;
+}
+
+.risk-label {
+  display: block;
+  font-size: 11px;
+  font-weight: normal;
+  margin-top: 2px;
+  opacity: 0.9;
+}
+
+.cell-status {
+  text-align: center;
+}
+
+.status-badge {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 12px;
+  color: white;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.cell-action {
+  text-align: center;
+}
+
+.btn-view {
+  background: #2196F3;
+  color: white;
+  border: none;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  transition: background 0.3s;
+}
+
+.btn-view:hover {
+  background: #1976D2;
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+  .email-list-controls {
+    flex-direction: column;
+  }
+
+  .filter-controls {
+    flex-direction: column;
+    width: 100%;
+  }
+
+  .select-control {
+    width: 100%;
+  }
+
+  .search-box {
+    width: 100%;
+  }
+
+  .email-table {
+    font-size: 12px;
+  }
+
+  .email-table th,
+  .email-table td {
+    padding: 8px;
+  }
+
+  .cell-subject {
+    max-width: 150px;
+  }
+
+  .cell-sender {
+    max-width: 120px;
+  }
+}
+
+@media (max-width: 480px) {
+  .email-list-container {
+    padding: 10px;
+  }
+
+  .email-table {
+    font-size: 11px;
+  }
+
+  .email-table th,
+  .email-table td {
+    padding: 6px;
+  }
+
+  .cell-subject,
+  .cell-sender {
+    max-width: 100px;
+  }
+
+  .btn-view {
+    padding: 4px 8px;
+    font-size: 10px;
+  }
+}

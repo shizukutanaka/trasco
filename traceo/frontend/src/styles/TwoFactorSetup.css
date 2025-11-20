@@ -1,0 +1,548 @@
+/* Two-Factor Authentication Setup Styles */
+
+.two-factor-container {
+  position: relative;
+  max-width: 600px;
+  margin: 0 auto;
+  padding: 20px;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  border-radius: 12px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.15);
+}
+
+.twofa-card {
+  background: white;
+  border-radius: 10px;
+  padding: 30px;
+  margin: 20px 0;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+  animation: slideUp 0.3s ease-out;
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.twofa-card h2 {
+  color: #333;
+  margin-bottom: 15px;
+  font-size: 24px;
+  font-weight: 600;
+}
+
+.twofa-card h3 {
+  color: #444;
+  margin-bottom: 12px;
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.description {
+  color: #666;
+  margin-bottom: 20px;
+  line-height: 1.5;
+}
+
+/* QR Code Section */
+.qr-code-container {
+  display: flex;
+  justify-content: center;
+  padding: 30px 0;
+  background: #f8f9fa;
+  border-radius: 8px;
+  margin: 20px 0;
+}
+
+.qr-code {
+  width: 250px;
+  height: 250px;
+  border: 3px solid #ddd;
+  padding: 10px;
+  background: white;
+}
+
+.secret-section {
+  margin: 20px 0;
+}
+
+.secret-section label {
+  display: block;
+  color: #666;
+  margin-bottom: 10px;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.secret-display {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 15px;
+  background: #f0f4ff;
+  border: 2px solid #667eea;
+  border-radius: 8px;
+  font-family: "Courier New", monospace;
+  font-size: 16px;
+  font-weight: bold;
+  letter-spacing: 2px;
+  word-break: break-all;
+}
+
+.secret-display code {
+  flex: 1;
+  color: #333;
+}
+
+.btn-copy {
+  background: none;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+  transition: transform 0.2s;
+  padding: 5px 10px;
+}
+
+.btn-copy:hover {
+  transform: scale(1.2);
+}
+
+/* Form Group */
+.form-group {
+  margin: 20px 0;
+}
+
+.form-group label {
+  display: block;
+  color: #333;
+  margin-bottom: 8px;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.input {
+  width: 100%;
+  padding: 12px;
+  border: 2px solid #ddd;
+  border-radius: 8px;
+  font-size: 16px;
+  font-family: "Courier New", monospace;
+  letter-spacing: 2px;
+  transition: border-color 0.3s;
+  box-sizing: border-box;
+}
+
+.input:focus {
+  outline: none;
+  border-color: #667eea;
+  box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+}
+
+/* Backup Codes */
+.backup-codes-container {
+  margin: 25px 0;
+}
+
+.backup-codes-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  margin: 20px 0;
+  padding: 20px;
+  background: #f8f9fa;
+  border-radius: 8px;
+  border: 2px dashed #ddd;
+}
+
+.backup-code {
+  padding: 12px;
+  background: white;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  text-align: center;
+  font-family: "Courier New", monospace;
+  font-weight: bold;
+  color: #333;
+  user-select: all;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.backup-code:hover {
+  background: #f0f4ff;
+  border-color: #667eea;
+  box-shadow: 0 2px 8px rgba(102, 126, 234, 0.15);
+}
+
+.backup-code code {
+  color: #667eea;
+  font-size: 14px;
+  letter-spacing: 1px;
+}
+
+/* Hints */
+.hint {
+  color: #666;
+  font-size: 13px;
+  line-height: 1.6;
+  padding: 12px;
+  background: #f0f4ff;
+  border-left: 3px solid #667eea;
+  border-radius: 4px;
+  margin: 15px 0;
+}
+
+/* Buttons */
+.btn {
+  padding: 12px 24px;
+  border: none;
+  border-radius: 8px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s;
+  display: inline-block;
+  margin-right: 10px;
+  margin-top: 15px;
+}
+
+.btn:last-child {
+  margin-right: 0;
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+}
+
+.btn-primary:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
+}
+
+.btn-primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  background: #f0f4ff;
+  color: #667eea;
+  border: 2px solid #667eea;
+}
+
+.btn-secondary:hover {
+  background: #667eea;
+  color: white;
+}
+
+.btn-danger {
+  background: #ff6b6b;
+  color: white;
+  border: none;
+}
+
+.btn-danger:hover {
+  background: #ff5252;
+}
+
+.backup-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 20px 0;
+}
+
+.backup-actions .btn {
+  flex: 1;
+  min-width: 150px;
+  margin: 0;
+  text-align: center;
+}
+
+/* Status Card */
+.twofa-status-card {
+  background: white;
+  border-radius: 10px;
+  padding: 25px;
+  margin: 20px 0;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+  border-left: 4px solid #667eea;
+}
+
+.twofa-status-card h3 {
+  color: #333;
+  margin-bottom: 20px;
+}
+
+.status-info {
+  margin: 20px 0;
+  padding: 15px;
+  background: #f8f9fa;
+  border-radius: 8px;
+}
+
+.status-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 0;
+  border-bottom: 1px solid #ddd;
+}
+
+.status-item:last-child {
+  border-bottom: none;
+}
+
+.status-item .label {
+  color: #666;
+  font-weight: 600;
+}
+
+.status-item .value {
+  color: #333;
+  font-weight: 500;
+}
+
+.status {
+  padding: 6px 12px;
+  border-radius: 20px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.status.enabled {
+  background: #d4edda;
+  color: #155724;
+}
+
+.status.disabled {
+  background: #f8d7da;
+  color: #721c24;
+}
+
+.status-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 20px;
+  flex-wrap: wrap;
+}
+
+.status-actions .btn {
+  flex: 1;
+  min-width: 150px;
+  margin: 0;
+}
+
+/* Modal Styles */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: fadeIn 0.2s ease-out;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.modal-content {
+  background: white;
+  border-radius: 12px;
+  padding: 30px;
+  max-width: 500px;
+  width: 90%;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+  animation: slideUp 0.3s ease-out;
+}
+
+.modal-content h3 {
+  color: #333;
+  margin-bottom: 15px;
+}
+
+.modal-content p {
+  color: #666;
+  margin-bottom: 20px;
+  line-height: 1.5;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 25px;
+}
+
+.modal-actions .btn {
+  flex: 1;
+  margin: 0;
+}
+
+/* Alerts */
+.alert {
+  padding: 15px;
+  border-radius: 8px;
+  margin: 15px 0;
+  font-size: 14px;
+  animation: slideUp 0.3s ease-out;
+}
+
+.alert-success {
+  background: #d4edda;
+  color: #155724;
+  border: 1px solid #c3e6cb;
+}
+
+.alert-error {
+  background: #f8d7da;
+  color: #721c24;
+  border: 1px solid #f5c6cb;
+}
+
+.alert-warning {
+  background: #fff3cd;
+  color: #856404;
+  border: 1px solid #ffeaa7;
+}
+
+/* Close Button */
+.btn-close {
+  position: absolute;
+  top: 15px;
+  right: 15px;
+  background: rgba(255, 255, 255, 0.8);
+  border: none;
+  width: 35px;
+  height: 35px;
+  border-radius: 50%;
+  font-size: 24px;
+  cursor: pointer;
+  color: #333;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  hover: {
+    background: white;
+  }
+}
+
+.btn-close:hover {
+  background: white;
+  transform: rotate(90deg);
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+  .two-factor-container {
+    padding: 15px;
+  }
+
+  .twofa-card {
+    padding: 20px;
+  }
+
+  .backup-codes-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .qr-code {
+    width: 200px;
+    height: 200px;
+  }
+
+  .backup-actions {
+    flex-direction: column;
+  }
+
+  .backup-actions .btn {
+    width: 100%;
+    min-width: auto;
+  }
+
+  .modal-content {
+    max-width: 90vw;
+    padding: 20px;
+  }
+
+  .status-actions {
+    flex-direction: column;
+  }
+
+  .status-actions .btn {
+    width: 100%;
+  }
+}
+
+/* Dark Mode Support */
+@media (prefers-color-scheme: dark) {
+  .twofa-card {
+    background: #2d3748;
+    color: #e2e8f0;
+  }
+
+  .twofa-card h2,
+  .twofa-card h3 {
+    color: #f7fafc;
+  }
+
+  .description,
+  .hint {
+    color: #cbd5e0;
+  }
+
+  .input {
+    background: #1a202c;
+    color: #e2e8f0;
+    border-color: #4a5568;
+  }
+
+  .input:focus {
+    border-color: #667eea;
+  }
+
+  .secret-display {
+    background: #1a202c;
+    color: #e2e8f0;
+    border-color: #667eea;
+  }
+
+  .status-info,
+  .qr-code-container {
+    background: #1a202c;
+    color: #e2e8f0;
+  }
+
+  .backup-codes-grid {
+    background: #1a202c;
+  }
+
+  .backup-code {
+    background: #2d3748;
+    color: #e2e8f0;
+  }
+
+  .modal-content {
+    background: #2d3748;
+    color: #e2e8f0;
+  }
+}

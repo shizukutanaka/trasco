@@ -1,0 +1,639 @@
+###############################################################################
+# Advanced Auto-Scaling Configuration for Prometheus
+#
+# Implements intelligent scaling based on:
+# - Query load (QPS metrics)
+# - Cardinality growth
+# - Ingestion rate
+# - Storage growth
+#
+# Technologies:
+# - Kubernetes HPA (Horizontal Pod Autoscaler)
+# - KEDA (Event-Driven Auto-scaling)
+# - Custom Prometheus metrics
+# - Prometheus Adapter
+#
+# Research sources:
+# - Kubernetes HPA documentation (v1.28+)
+# - KEDA documentation (scalers, custom metrics)
+# - Prometheus community scaling patterns
+# - Real-world case studies (billion+ metrics)
+###############################################################################
+
+---
+## ============================================================================
+## PROMETHEUS ADAPTER (Custom Metrics for HPA)
+## ============================================================================
+## Converts Prometheus metrics to Kubernetes custom metrics
+## Allows HPA to scale based on any Prometheus metric
+## ============================================================================
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus-adapter
+  namespace: monitoring
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus-adapter
+rules:
+  - apiGroups: ["custom.metrics.k8s.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: ["external.metrics.k8s.io"]
+    resources: ["*"]
+    verbs: ["*"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-adapter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus-adapter
+subjects:
+  - kind: ServiceAccount
+    name: prometheus-adapter
+    namespace: monitoring
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adapter-config
+  namespace: monitoring
+data:
+  config.yaml: |
+    # Prometheus Adapter configuration
+
+    rules:
+      # Custom metrics for application scaling
+      - seriesQuery: 'http_requests_total'
+        seriesFilters:
+          - isNot: "^$"
+        resources:
+          template: <<.Resource>>
+        name:
+          matches: "^(.*)_total$"
+          as: "${1}_per_second"
+        metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[1m])) by (<<.GroupBy>>)'
+
+      # Request latency (p95) for scaling
+      - seriesQuery: 'http_request_duration_seconds_bucket'
+        seriesFilters:
+          - isNot: "^$"
+        resources:
+          template: <<.Resource>>
+        name:
+          as: "request_latency_p95"
+        metricsQuery: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket{<<.LabelMatchers>>}[1m])) by (le, <<.GroupBy>>)
+          )
+
+      # Error rate for scaling
+      - seriesQuery: 'http_requests_total'
+        seriesFilters:
+          - matches: "status=~\"5..\""
+        resources:
+          template: <<.Resource>>
+        name:
+          as: "error_rate"
+        metricsQuery: |
+          (sum(rate(http_requests_total{status=~"5..",<<.LabelMatchers>>}[1m])) by (<<.GroupBy>>)
+           /
+           sum(rate(http_requests_total{<<.LabelMatchers>>}[1m])) by (<<.GroupBy>>))
+          * 100
+
+      # Resource usage metrics
+      - seriesQuery: 'node_cpu_seconds_total'
+        resources:
+          template: <<.Resource>>
+        name:
+          as: "node_cpu_percent"
+        metricsQuery: |
+          (100 - (avg(irate(node_cpu_seconds_total{mode="idle",<<.LabelMatchers>>}[1m])) by (<<.GroupBy>>) * 100))
+
+      - seriesQuery: 'container_memory_working_set_bytes'
+        resources:
+          template: <<.Resource>>
+        name:
+          as: "container_memory_percent"
+        metricsQuery: |
+          (sum(container_memory_working_set_bytes{<<.LabelMatchers>>}) by (<<.GroupBy>>) / sum(kube_pod_container_resource_limits{resource="memory",<<.LabelMatchers>>}) by (<<.GroupBy>>) * 100)
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus-adapter
+  namespace: monitoring
+  labels:
+    app: prometheus-adapter
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: prometheus-adapter
+
+  template:
+    metadata:
+      labels:
+        app: prometheus-adapter
+
+    spec:
+      serviceAccountName: prometheus-adapter
+
+      containers:
+      - name: prometheus-adapter
+        image: registry.k8s.io/prometheus-adapter/prometheus-adapter:v0.11.0
+        imagePullPolicy: IfNotPresent
+
+        args:
+          - "--prometheus-url=http://prometheus:9090"
+          - "--cert-dir=/var/run/serving-cert"
+          - "--config=/etc/adapter/config.yaml"
+          - "--logtostderr=true"
+          - "--v=4"
+
+        ports:
+        - containerPort: 6443
+          name: https
+
+        volumeMounts:
+        - name: adapter-config
+          mountPath: /etc/adapter
+          readOnly: true
+        - name: temp-vol
+          mountPath: /var/run/serving-cert
+
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 6443
+            scheme: HTTPS
+          initialDelaySeconds: 30
+          periodSeconds: 10
+
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 6443
+            scheme: HTTPS
+          initialDelaySeconds: 30
+          periodSeconds: 10
+
+      volumes:
+      - name: adapter-config
+        configMap:
+          name: adapter-config
+      - name: temp-vol
+        emptyDir: {}
+
+---
+## ============================================================================
+## KEDA SCALER CONFIGURATION (Event-Driven Auto-scaling)
+## ============================================================================
+## More flexible than HPA - supports external event sources
+## Handles complex scaling logic (multiple metrics, etc.)
+## ============================================================================
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keda-operator
+  namespace: keda
+
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: prometheus-auth
+  namespace: monitoring
+spec:
+  secretTargetRef:
+    - parameter: authModes
+      name: prometheus-secret
+      key: auth-modes
+
+---
+# Scale application pods based on Prometheus metrics
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: app-scaling
+  namespace: traceo
+spec:
+  scaleTargetRef:
+    name: backend-deployment
+    kind: Deployment
+
+  minReplicaCount: 2
+  maxReplicaCount: 50
+  pollingInterval: 30        # Check metrics every 30s
+  cooldownPeriod: 300        # Cool down for 5 minutes
+  fallback:
+    failureThreshold: 5
+    replicas: 10             # Fall back to 10 replicas on failure
+
+  triggers:
+    # Trigger 1: Request rate (scale up at 1000 req/s per pod)
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus:9090
+        metricName: http_requests_per_second
+        threshold: "1000"
+        query: |
+          sum(rate(http_requests_total{job="backend"}[1m])) / count(count by (pod) (rate(http_requests_total{job="backend"}[1m])))
+
+    # Trigger 2: Error rate (scale up if >5% errors)
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus:9090
+        metricName: error_rate
+        threshold: "5"
+        query: |
+          (sum(rate(http_requests_total{job="backend",status=~"5.."}[1m])) / sum(rate(http_requests_total{job="backend"}[1m]))) * 100
+
+    # Trigger 3: Response time p95 (scale up if >1s)
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus:9090
+        metricName: latency_p95
+        threshold: "1000"
+        query: |
+          histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="backend"}[1m])) by (le))
+
+    # Trigger 4: Queue depth (scale up based on pending work)
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus:9090
+        metricName: queue_depth
+        threshold: "100"
+        query: |
+          sum(increase(job_queue_size_bytes[1m]))
+
+---
+## ============================================================================
+## HORIZONTAL POD AUTOSCALER (Kubernetes Native)
+## ============================================================================
+## Simple scaling based on multiple metrics
+## Works with Prometheus Adapter for custom metrics
+## ============================================================================
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: prometheus-hpa
+  namespace: monitoring
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: prometheus
+
+  minReplicas: 2
+  maxReplicas: 10
+
+  metrics:
+    # Metric 1: CPU utilization
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+    # Metric 2: Memory utilization
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+    # Metric 3: Custom metric - query QPS
+    - type: Pods
+      pods:
+        metric:
+          name: prometheus_query_rate
+        target:
+          type: AverageValue
+          averageValue: "1000"
+
+    # Metric 4: Custom metric - ingestion rate
+    - type: Pods
+      pods:
+        metric:
+          name: prometheus_tsdb_samples_appended
+        target:
+          type: AverageValue
+          averageValue: "100000"
+
+  # Behavior policies
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Min  # Choose minimum scale-down
+
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30  # Double pods every 30s
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+      selectPolicy: Max  # Choose maximum scale-up
+
+---
+## ============================================================================
+## MIMIR INGESTER AUTO-SCALING
+## ============================================================================
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mimir-ingester-hpa
+  namespace: monitoring
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: mimir-ingester
+
+  minReplicas: 3
+  maxReplicas: 100
+
+  metrics:
+    # CPU-based scaling
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+    # Memory-based scaling
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+
+---
+## ============================================================================
+## CUSTOM METRICS (Recording Rules for Scaling)
+## ============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scaling-metrics-rules
+  namespace: monitoring
+data:
+  scaling-rules.yml: |
+    groups:
+      - name: scaling_metrics
+        interval: 30s
+        rules:
+          # Query rate (for HPA)
+          - record: prometheus:query_rate:5m
+            expr: rate(prometheus_engine_queries_total[5m])
+
+          # Ingestion rate (samples per second)
+          - record: prometheus:ingestion_rate:5m
+            expr: rate(prometheus_tsdb_samples_appended_total[5m])
+
+          # Cardinality growth rate
+          - record: prometheus:cardinality_growth:1h
+            expr: rate(prometheus_tsdb_metric_chunks_created_total[1h])
+
+          # Series per pod (for even distribution)
+          - record: prometheus:series_per_pod
+            expr: |
+              count(prometheus_tsdb_metric_chunks_created_total) /
+              count(count by (pod) (prometheus_tsdb_metric_chunks_created_total))
+
+          # Query queue depth
+          - record: prometheus:query_queue_depth
+            expr: prometheus_tsdb_queries_pending
+
+          # Memory pressure indicator
+          - record: prometheus:memory_pressure
+            expr: process_resident_memory_bytes / process_virtual_memory_max_bytes
+
+          # Storage saturation
+          - record: prometheus:storage_saturation
+            expr: prometheus_tsdb_storage_total_bytes / 107374182400  # 100GB
+
+          # WAL size (risk of data loss if exceeds limit)
+          - record: prometheus:wal_risk_factor
+            expr: |
+              sum(prometheus_tsdb_wal_segment_current_size) /
+              (1073741824 * 2)  # Risk threshold
+
+---
+## ============================================================================
+## ALERTING FOR AUTO-SCALING ISSUES
+## ============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autoscaling-alerts
+  namespace: monitoring
+data:
+  autoscaling-rules.yml: |
+    groups:
+      - name: autoscaling_alerts
+        interval: 30s
+        rules:
+          # HPA maxed out
+          - alert: HPAReachedMaxReplicas
+            expr: |
+              count(kubernetes_namespace_pods{pod=~"prometheus.*"}) >= 10
+            for: 5m
+            labels:
+              severity: critical
+              scope: scaling
+            annotations:
+              summary: "Prometheus HPA reached maximum replicas"
+              description: "Current replicas: {{ $value }}, max: 10"
+
+          # Cardinality explosion detected
+          - alert: CardinalityExplosion
+            expr: prometheus:cardinality_growth:1h > 1000000
+            for: 10m
+            labels:
+              severity: critical
+              scope: cardinality
+            annotations:
+              summary: "Rapid cardinality growth detected"
+              description: "Growth rate: {{ $value }} series/hour"
+
+          # Ingestion rate exceeds capacity
+          - alert: IngestionRateCritical
+            expr: prometheus:ingestion_rate:5m > 1000000
+            for: 5m
+            labels:
+              severity: critical
+              scope: ingestion
+            annotations:
+              summary: "Ingestion rate critical"
+              description: "Current rate: {{ $value }} samples/sec"
+
+          # Storage saturation
+          - alert: StorageNearCapacity
+            expr: prometheus:storage_saturation > 0.9
+            for: 10m
+            labels:
+              severity: warning
+              scope: storage
+            annotations:
+              summary: "Prometheus storage near capacity"
+              description: "Storage saturation: {{ $value | humanizePercentage }}"
+
+          # Memory exhaustion risk
+          - alert: MemoryExhaustionRisk
+            expr: prometheus:memory_pressure > 0.95
+            for: 5m
+            labels:
+              severity: critical
+              scope: memory
+            annotations:
+              summary: "Prometheus memory exhaustion risk"
+              description: "Memory pressure: {{ $value | humanizePercentage }}"
+
+          # WAL data loss risk
+          - alert: WALDataLossRisk
+            expr: prometheus:wal_risk_factor > 0.8
+            for: 5m
+            labels:
+              severity: critical
+              scope: wal
+            annotations:
+              summary: "WAL approaching critical size (data loss risk)"
+              description: "WAL risk factor: {{ $value | humanizePercentage }}"
+
+---
+## ============================================================================
+## SCALING CONFIGURATION FOR DIFFERENT SCENARIOS
+## ============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scaling-scenarios
+  namespace: monitoring
+data:
+  scaling-guide.md: |
+    # Auto-Scaling Configuration Guide
+
+    ## Scenario 1: Query Load Spike (E-commerce Black Friday)
+    **Trigger**: Request rate > 10K req/s
+    **Action**: Scale frontend (HPA), scale Prometheus replicas
+    **Configuration**:
+    - Max QPS per pod: 1000
+    - Scale-up: +100% every 30s
+    - Scale-down: -10% every 300s
+
+    ```yaml
+    triggers:
+      - type: prometheus
+        query: sum(rate(http_requests_total[1m]))
+        threshold: 10000
+    ```
+
+    ## Scenario 2: Cardinality Explosion (Bug in labels)
+    **Trigger**: Cardinality growth > 1M series/hour
+    **Action**: Alert ops team, scale ingesters, trigger metric cleanup
+    **Configuration**:
+    - Detection: 1h growth window
+    - Alert severity: critical
+    - Auto-action: Drop problematic labels
+
+    ## Scenario 3: Memory Pressure
+    **Trigger**: Memory usage > 80% of limit
+    **Action**: Scale pods, trigger cardinality cleanup
+    **Configuration**:
+    - Scale-up: +50% per 30s
+    - Cooldown: 300s
+    - Max replicas: 100
+
+    ## Scenario 4: Slow Query Performance
+    **Trigger**: Query latency p99 > 5s
+    **Action**: Scale query replicas, optimize recording rules
+    **Configuration**:
+    - Dedicated query nodes
+    - Query cache tuning
+    - Recording rule evaluation
+
+    ## Recommended Scaling Thresholds
+
+    | Metric | Warning | Critical | Action |
+    |--------|---------|----------|--------|
+    | CPU | 70% | 85% | Scale up |
+    | Memory | 75% | 90% | Scale up |
+    | Cardinality | 50M | 100M | Cleanup |
+    | Ingestion | 500K sps | 1M sps | Scale ingesters |
+    | Query QPS | 1000 | 5000 | Scale query nodes |
+
+    ## Cost Optimization vs Performance
+
+    ### Aggressive Scaling (Cost-First)
+    - Min replicas: 1
+    - Max replicas: 10
+    - Scale-down: Fast (60s)
+    - Scale-up: Slow (300s)
+    - Suitable: Dev/staging, non-critical
+
+    ### Balanced (Default)
+    - Min replicas: 2
+    - Max replicas: 50
+    - Scale-down: Medium (300s)
+    - Scale-up: Medium (60s)
+    - Suitable: Production
+
+    ### Performance-First (Cost-Last)
+    - Min replicas: 5
+    - Max replicas: 100+
+    - Scale-down: Slow (600s)
+    - Scale-up: Fast (30s)
+    - Suitable: Mission-critical
