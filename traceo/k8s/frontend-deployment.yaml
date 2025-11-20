@@ -1,0 +1,386 @@
+---
+# Traceo Frontend - Kubernetes Deployment
+# Production-ready configuration with HPA, health checks, security policies
+# Date: November 21, 2024
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: traceo-frontend
+  labels:
+    app: traceo
+    component: frontend
+
+---
+# ConfigMap for environment configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traceo-frontend-config
+  namespace: traceo-frontend
+data:
+  VITE_API_URL: "https://api.traceo.example.com"
+  VITE_WS_URL: "wss://ws.traceo.example.com"
+  NODE_ENV: "production"
+
+---
+# Frontend Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traceo-frontend
+  namespace: traceo-frontend
+  labels:
+    app: traceo
+    component: frontend
+    version: v1
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: traceo
+      component: frontend
+  template:
+    metadata:
+      labels:
+        app: traceo
+        component: frontend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: traceo-frontend
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        fsGroup: 101
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - traceo
+                topologyKey: kubernetes.io/hostname
+
+      containers:
+        - name: frontend
+          image: traceo-frontend:latest
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+
+          env:
+            - name: VITE_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: traceo-frontend-config
+                  key: VITE_API_URL
+
+            - name: VITE_WS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: traceo-frontend-config
+                  key: VITE_WS_URL
+
+            - name: NODE_ENV
+              value: "production"
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+
+          volumeMounts:
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-pid
+              mountPath: /var/run
+            - name: nginx-log
+              mountPath: /var/log/nginx
+
+      volumes:
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-pid
+          emptyDir: {}
+        - name: nginx-log
+          emptyDir: {}
+
+---
+# Frontend Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: traceo-frontend
+  namespace: traceo-frontend
+  labels:
+    app: traceo
+    component: frontend
+spec:
+  type: ClusterIP
+  selector:
+    app: traceo
+    component: frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+
+---
+# Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: traceo-frontend-hpa
+  namespace: traceo-frontend
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: traceo-frontend
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# Pod Disruption Budget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: traceo-frontend-pdb
+  namespace: traceo-frontend
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: traceo
+      component: frontend
+
+---
+# NetworkPolicy - Restrict traffic
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: traceo-frontend-netpol
+  namespace: traceo-frontend
+spec:
+  podSelector:
+    matchLabels:
+      app: traceo
+      component: frontend
+  policyTypes:
+    - Ingress
+    - Egress
+
+  # Allow ingress from Ingress controller
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 80
+
+  # Allow egress to API backend
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              app: traceo
+      ports:
+        - protocol: TCP
+          port: 8000
+
+    # Allow DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+
+---
+# ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: traceo-frontend
+  namespace: traceo-frontend
+
+---
+# Role
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: traceo-frontend
+  namespace: traceo-frontend
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list"]
+
+---
+# RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: traceo-frontend
+  namespace: traceo-frontend
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: traceo-frontend
+subjects:
+  - kind: ServiceAccount
+    name: traceo-frontend
+    namespace: traceo-frontend
+
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: traceo-frontend
+  namespace: traceo-frontend
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - traceo.example.com
+      secretName: traceo-frontend-tls
+  rules:
+    - host: traceo.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: traceo-frontend
+                port:
+                  number: 80
+
+---
+# PrometheusRule for monitoring
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: traceo-frontend-alerts
+  namespace: traceo-frontend
+spec:
+  groups:
+    - name: frontend
+      interval: 30s
+      rules:
+        - alert: TraceoFrontendDown
+          expr: |
+            up{job="traceo-frontend"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            component: frontend
+          annotations:
+            summary: "Traceo frontend is down"
+            description: "Traceo frontend service is unavailable"
+
+        - alert: TraceoFrontendHighErrorRate
+          expr: |
+            rate(nginx_requests_total{status=~"5.."}[5m]) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+            component: frontend
+          annotations:
+            summary: "Traceo frontend high error rate"
+            description: "Error rate > 5% for the last 5 minutes"
+
+        - alert: TraceoFrontendHighLatency
+          expr: |
+            histogram_quantile(0.95, rate(nginx_request_duration_seconds_bucket[5m])) > 1
+          for: 5m
+          labels:
+            severity: warning
+            component: frontend
+          annotations:
+            summary: "Traceo frontend high latency"
+            description: "p95 request latency > 1 second"
+
+---
+# ServiceMonitor for Prometheus
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: traceo-frontend
+  namespace: traceo-frontend
+spec:
+  selector:
+    matchLabels:
+      app: traceo
+      component: frontend
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
