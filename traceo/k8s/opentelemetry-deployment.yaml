@@ -1,0 +1,827 @@
+###############################################################################
+# OpenTelemetry Collector & Jaeger Distributed Tracing
+#
+# Complete deployment for distributed tracing and observability
+# - OTEL Collector: Receives and processes telemetry
+# - Jaeger Backend: Stores and visualizes traces
+# - Integration with Prometheus metrics and eBPF profiling
+#
+# Research sources:
+# - OpenTelemetry specification and best practices
+# - Jaeger project documentation
+# - W3C Trace Context standard
+# - Distributed tracing patterns (Google, Uber, Shopify)
+###############################################################################
+
+---
+## ============================================================================
+## OPENTELEMETRY COLLECTOR NAMESPACE AND RBAC
+## ============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: otel
+  labels:
+    prometheus: kube-prometheus
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector
+  namespace: otel
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods", "namespaces", "services"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: otel-collector
+subjects:
+- kind: ServiceAccount
+  name: otel-collector
+  namespace: otel
+
+---
+## ============================================================================
+## OPENTELEMETRY COLLECTOR CONFIGURATION
+## ============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: otel
+data:
+  otel-collector-config.yaml: |
+    # OpenTelemetry Collector configuration
+    # Receives traces, metrics, logs from applications
+    # Exports to Jaeger, Prometheus, and other backends
+
+    receivers:
+      # OTLP receiver (main entry point)
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+            max_recv_msg_size_mib: 16
+          http:
+            endpoint: 0.0.0.0:4318
+            max_request_body_size: 52428800  # 50MB
+
+      # Jaeger receiver (for compatibility)
+      jaeger:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:14250
+          thrift_http:
+            endpoint: 0.0.0.0:14268
+
+      # Prometheus receiver (scrape Prometheus metrics)
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: 'otel-collector'
+              static_configs:
+                - targets: ['localhost:8888']
+
+      # Host metrics collector
+      hostmetrics:
+        collection_interval: 30s
+        scrapers:
+          - cpu
+          - disk
+          - filesystem
+          - load
+          - memory
+          - network
+          - processes
+          - process
+
+    processors:
+      # Batch processor for efficiency
+      batch:
+        send_batch_size: 512
+        timeout: 5s
+
+      # Memory limiter for resource protection
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 512
+        spike_limit_mib: 128
+
+      # Resource detection
+      resourcedetection:
+        detectors: [gcp, env, system, kubernetes]
+        timeout: 2s
+
+      # Span processor for trace enrichment
+      attributes:
+        actions:
+          # Add service name if missing
+          - key: service.name
+            from_attribute: service
+            action: insert
+            if:
+              match_type: regexp
+              regexp: ^$
+          # Add environment
+          - key: deployment.environment
+            value: production
+            action: insert
+          # Add cluster name
+          - key: k8s.cluster.name
+            value: prod-cluster
+            action: insert
+
+      # Metrics transformation
+      metricstransform:
+        transforms:
+          # Rename metrics for consistency
+          - include: 'http_.*'
+            action: update
+            new_name: 'otel_http_{{metric_name}}'
+
+      # Span filtering (reduce cardinality)
+      attributes:
+        actions:
+          # Keep only important spans
+          - key: internal_span
+            value: false
+            action: upsert
+
+      # Metrics aggregation
+      metricsgenerator:
+        granularity: 1m
+        ingest_delay: 30s
+        final_delay: 5m
+
+    exporters:
+      # Jaeger exporter for distributed tracing
+      jaeger:
+        endpoint: jaeger-collector.tracing:14250
+        tls:
+          insecure: true
+
+      # Prometheus Remote Write for metrics
+      prometheusremotewrite:
+        endpoint: http://prometheus:9090/api/v1/write
+        metric_aggregation_type: histogram
+        resource_to_telemetry_conversion:
+          enabled: true
+
+      # OTLP exporter for profiling data
+      otlp:
+        endpoint: parca-server.profiling:7070
+        tls:
+          insecure: true
+        timeout: 10s
+        compression: snappy
+
+      # Loki for logs (optional)
+      loki:
+        endpoint: http://loki:3100/loki/api/v1/push
+        format: json
+        tls:
+          insecure: true
+
+      # Logging exporter (for debugging)
+      logging:
+        loglevel: info
+        sampling_initial: 100
+        sampling_thereafter: 1000
+
+    extensions:
+      # Health check endpoint
+      health_check:
+        endpoint: :13133
+
+      # Performance profiler
+      pprof:
+        endpoint: :1888
+
+      # Kubernetes attributes
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.deployment.name
+            - k8s.statefulset.name
+            - k8s.daemonset.name
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.pod.start_time
+
+    service:
+      extensions: [health_check, pprof, k8sattributes]
+      pipelines:
+        # Trace pipeline
+        traces:
+          receivers: [otlp, jaeger]
+          processors: [
+            memory_limiter,
+            batch,
+            resourcedetection,
+            attributes,
+            k8sattributes
+          ]
+          exporters: [jaeger, logging]
+
+        # Metrics pipeline
+        metrics:
+          receivers: [otlp, prometheus, hostmetrics]
+          processors: [
+            memory_limiter,
+            batch,
+            resourcedetection,
+            attributes,
+            metricstransform
+          ]
+          exporters: [prometheusremotewrite, logging]
+
+        # Logs pipeline (optional)
+        logs:
+          receivers: [otlp]
+          processors: [
+            memory_limiter,
+            batch,
+            resourcedetection,
+            attributes
+          ]
+          exporters: [loki, logging]
+
+---
+## ============================================================================
+## OPENTELEMETRY COLLECTOR DEPLOYMENT
+## ============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: otel
+  labels:
+    app: otel-collector
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: otel-collector
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8888"
+    spec:
+      serviceAccountName: otel-collector
+
+      # Pod anti-affinity for distribution
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - otel-collector
+              topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: otel-collector
+        image: otel/opentelemetry-collector-k8s:0.88.0
+        imagePullPolicy: IfNotPresent
+
+        command:
+          - /otelcontribcol
+          - --config=/conf/otel-collector-config.yaml
+
+        ports:
+        # OTLP receivers
+        - containerPort: 4317
+          name: otlp-grpc
+          protocol: TCP
+        - containerPort: 4318
+          name: otlp-http
+          protocol: TCP
+
+        # Jaeger receiver
+        - containerPort: 14250
+          name: jaeger-grpc
+          protocol: TCP
+        - containerPort: 14268
+          name: jaeger-http
+          protocol: TCP
+
+        # Prometheus receiver
+        - containerPort: 8889
+          name: prometheus
+          protocol: TCP
+
+        # Metrics
+        - containerPort: 8888
+          name: metrics
+          protocol: TCP
+
+        # Extensions
+        - containerPort: 13133
+          name: health-check
+          protocol: TCP
+        - containerPort: 1888
+          name: pprof
+          protocol: TCP
+
+        env:
+        - name: GOGC
+          value: "80"
+        - name: GOMEMLIMIT
+          value: "512MiB"
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://localhost:4317"
+
+        volumeMounts:
+        - name: collector-config
+          mountPath: /conf
+
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+
+        # Health checks
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 13133
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 5
+
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 13133
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+
+        # Security context
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65534
+
+      volumes:
+      - name: collector-config
+        configMap:
+          name: otel-collector-config
+          items:
+          - key: otel-collector-config.yaml
+            path: otel-collector-config.yaml
+
+      # Pod disruption budget
+      terminationGracePeriodSeconds: 30
+
+---
+## ============================================================================
+## OPENTELEMETRY COLLECTOR SERVICE
+## ============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: otel
+  labels:
+    app: otel-collector
+spec:
+  type: ClusterIP
+  ports:
+  # OTLP
+  - port: 4317
+    targetPort: 4317
+    protocol: TCP
+    name: otlp-grpc
+  - port: 4318
+    targetPort: 4318
+    protocol: TCP
+    name: otlp-http
+
+  # Jaeger
+  - port: 14250
+    targetPort: 14250
+    protocol: TCP
+    name: jaeger-grpc
+  - port: 14268
+    targetPort: 14268
+    protocol: TCP
+    name: jaeger-http
+
+  # Prometheus metrics
+  - port: 8888
+    targetPort: 8888
+    protocol: TCP
+    name: metrics
+
+  # Health check
+  - port: 13133
+    targetPort: 13133
+    protocol: TCP
+    name: health-check
+
+  selector:
+    app: otel-collector
+
+---
+## ============================================================================
+## JAEGER BACKEND DEPLOYMENT
+## ============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tracing
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jaeger
+  namespace: tracing
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: tracing
+  labels:
+    app: jaeger
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: jaeger
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: jaeger
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "14269"
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - jaeger
+              topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: jaeger
+        image: jaegertracing/all-in-one:1.50.0
+        imagePullPolicy: IfNotPresent
+
+        ports:
+        # Jaeger
+        - containerPort: 6831
+          name: jaeger-udp
+          protocol: UDP
+        - containerPort: 6832
+          name: jaeger-binary
+          protocol: UDP
+        - containerPort: 14250
+          name: jaeger-grpc
+          protocol: TCP
+        - containerPort: 14268
+          name: jaeger-http
+          protocol: TCP
+        - containerPort: 16686
+          name: jaeger-ui
+          protocol: TCP
+
+        # Metrics
+        - containerPort: 14269
+          name: metrics
+          protocol: TCP
+
+        env:
+        - name: COLLECTOR_GRPC_HOST_PORT
+          value: "0.0.0.0:14250"
+        - name: COLLECTOR_HTTP_HOST_PORT
+          value: "0.0.0.0:14268"
+        - name: QUERY_BASE_PATH
+          value: "/"
+        - name: MEMORY_MAX_TRACES
+          value: "10000"
+        - name: SPAN_STORAGE_TYPE
+          value: "badger"
+        - name: BADGER_EPHEMERAL
+          value: "false"
+        - name: BADGER_DIRECTORY_VALUE
+          value: "/badger/data"
+        - name: BADGER_DIRECTORY_KEY
+          value: "/badger/key"
+
+        volumeMounts:
+        - name: storage
+          mountPath: /badger
+
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 16686
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 5
+
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 16686
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65534
+
+      volumes:
+      - name: storage
+        persistentVolumeClaim:
+          claimName: jaeger-storage
+
+      terminationGracePeriodSeconds: 30
+
+---
+## ============================================================================
+## JAEGER STORAGE
+## ============================================================================
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jaeger-storage
+  namespace: tracing
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+## ============================================================================
+## JAEGER SERVICE
+## ============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-collector
+  namespace: tracing
+  labels:
+    app: jaeger
+spec:
+  type: ClusterIP
+  ports:
+  - port: 6831
+    targetPort: 6831
+    protocol: UDP
+    name: jaeger-udp
+  - port: 6832
+    targetPort: 6832
+    protocol: UDP
+    name: jaeger-binary
+  - port: 14250
+    targetPort: 14250
+    protocol: TCP
+    name: jaeger-grpc
+  - port: 14268
+    targetPort: 14268
+    protocol: TCP
+    name: jaeger-http
+  selector:
+    app: jaeger
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-query
+  namespace: tracing
+  labels:
+    app: jaeger
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 16686
+    targetPort: 16686
+    protocol: TCP
+    name: jaeger-ui
+  - port: 14269
+    targetPort: 14269
+    protocol: TCP
+    name: metrics
+  selector:
+    app: jaeger
+
+---
+## ============================================================================
+## SERVICEMONITOR FOR PROMETHEUS INTEGRATION
+## ============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: otel-collector
+  namespace: otel
+  labels:
+    prometheus: kube-prometheus
+spec:
+  selector:
+    matchLabels:
+      app: otel-collector
+  endpoints:
+  - port: metrics
+    interval: 30s
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: jaeger
+  namespace: tracing
+  labels:
+    prometheus: kube-prometheus
+spec:
+  selector:
+    matchLabels:
+      app: jaeger
+  endpoints:
+  - port: metrics
+    interval: 30s
+
+---
+## ============================================================================
+## ALERT RULES FOR TRACING SYSTEM
+## ============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: otel-tracing-alerts
+  namespace: otel
+spec:
+  groups:
+  - name: tracing.rules
+    interval: 30s
+    rules:
+    # OTEL Collector health
+    - alert: OTELCollectorDown
+      expr: up{job="otel-collector"} == 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "OTEL Collector is down"
+        description: "OTEL Collector not responding to health checks"
+
+    # High trace ingestion rate
+    - alert: HighTraceIngestionRate
+      expr: |
+        sum(rate(otelcol_receiver_accepted_spans[5m])) > 100000
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High trace ingestion rate: {{ $value }} spans/sec"
+
+    # Jaeger storage issues
+    - alert: JaegerStorageFull
+      expr: |
+        kubelet_volume_stats_used_bytes{persistentvolumeclaim="jaeger-storage"} /
+        kubelet_volume_stats_capacity_bytes{persistentvolumeclaim="jaeger-storage"} > 0.9
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Jaeger storage 90% full"
+
+    # Traces being dropped
+    - alert: TracesDropped
+      expr: |
+        sum(rate(otelcol_exporter_enqueue_failed_spans[5m])) > 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Traces being dropped in exporter"
+
+---
+## ============================================================================
+## DEPLOYMENT SUMMARY
+## ============================================================================
+##
+## This configuration implements complete distributed tracing with:
+##
+## 1. OPENTELEMETRY COLLECTOR
+##    - Receives OTLP traces, metrics, logs
+##    - Processes and enriches telemetry
+##    - Exports to Jaeger, Prometheus, Parca
+##    - 2 replicas for HA
+##    - Resource limits and health checks
+##
+## 2. JAEGER BACKEND
+##    - All-in-one deployment with Badger storage
+##    - UI on port 16686 for trace visualization
+##    - 2 replicas with persistent storage (20Gi)
+##    - Health monitoring and metrics export
+##
+## 3. PROMETHEUS INTEGRATION
+##    - ServiceMonitor for automatic scraping
+##    - PrometheusRule for alerting
+##    - Metrics on high trace ingestion
+##    - Storage health monitoring
+##
+## KEY CAPABILITIES:
+##   ✅ W3C Trace Context propagation
+##   ✅ Automatic service discovery
+##   ✅ Kubernetes metadata enrichment
+##   ✅ Resource-efficient batch processing
+##   ✅ High availability deployment
+##   ✅ Persistent trace storage
+##   ✅ Real-time alerting
+##
+## DEPLOYMENT STEPS:
+##   1. kubectl apply -f opentelemetry-deployment.yaml
+##   2. Wait for pods: kubectl get pods -n otel,tracing
+##   3. Port-forward Jaeger: kubectl port-forward -n tracing svc/jaeger-query 16686:16686
+##   4. Access: http://localhost:16686
+##   5. Instrument applications with OTEL SDK
+##   6. Send traces to otel-collector:4317 (gRPC) or :4318 (HTTP)
+##
+## ============================================================================
