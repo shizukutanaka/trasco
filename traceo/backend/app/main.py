@@ -53,14 +53,8 @@ async def startup_event():
         init_db()
         logger.info("Database initialized")
 
-        # Initialize RBAC system roles
-        from app.database import SessionLocal
-        from app.rbac import RBACService
-
-        db = SessionLocal()
-        RBACService.init_system_roles(db)
-        db.close()
-        logger.info("RBAC system initialized")
+        # RBAC system uses in-memory role definitions (enterprise_policy_engine.py)
+        logger.info("RBAC system ready")
     except Exception as e:
         logger.error(f"Startup initialization failed: {e}")
 
