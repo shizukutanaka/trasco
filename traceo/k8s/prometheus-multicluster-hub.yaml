@@ -1,0 +1,439 @@
+---
+# Prometheus Hub Cluster - Central Aggregation Point
+# Receives remote writes from all edge clusters
+# Date: November 21, 2024
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: prometheus-hub
+  labels:
+    app: traceo
+    component: prometheus-hub
+
+---
+# ConfigMap for Prometheus hub configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-hub-config
+  namespace: prometheus-hub
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 1m
+      evaluation_interval: 1m
+      external_labels:
+        cluster: hub
+        region: us-central
+        environment: production
+
+    # Enable scraping metrics from self
+    scrape_configs:
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+
+      # Remote write API for receiving data from edge clusters
+      - job_name: 'remote-write-push'
+        static_configs:
+          - targets: ['127.0.0.1:9009']  # Receiver on port 9009
+
+    # Recording rules for multi-cluster aggregation
+    rule_files:
+      - '/etc/prometheus/recording_rules.yml'
+
+    # Remote storage configuration (long-term)
+    remote_write:
+      - url: "http://prometheus-receiver:19291/api/v1/receive"
+        queue_config:
+          capacity: 100000
+          max_shards: 10
+          max_samples_per_send: 1000
+          batch_send_wait: 10s
+        metadata_config:
+          send: true
+          send_interval: 1m
+
+  recording_rules.yml: |
+    groups:
+      - name: multi_cluster_aggregation
+        interval: 1m
+        rules:
+          # Aggregate CPU across all clusters
+          - record: "cluster:node_cpu_seconds_total:rate5m"
+            expr: "sum(rate(node_cpu_seconds_total[5m])) by (cluster, mode)"
+
+          # Aggregate memory across all clusters
+          - record: "cluster:node_memory_MemAvailable_bytes"
+            expr: "sum(node_memory_MemAvailable_bytes) by (cluster)"
+
+          # Aggregate requests per cluster
+          - record: "cluster:http_requests_total:rate5m"
+            expr: "sum(rate(http_requests_total[5m])) by (cluster, service, status_code)"
+
+          # Aggregate errors per cluster
+          - record: "cluster:http_requests_total:errors_rate5m"
+            expr: "sum(rate(http_requests_total{status_code=~\"5..\"}[5m])) by (cluster, service)"
+
+          # Pod count per cluster
+          - record: "cluster:pod_count"
+            expr: "count(up{job=~\"kubelet\"}) by (cluster)"
+
+          # Node count per cluster
+          - record: "cluster:node_count"
+            expr: "count(node_cpu_seconds_total) by (cluster) / 60"
+
+---
+# StorageClass for Prometheus data (if using persistent storage)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: prometheus-hub-storage
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  iops: "3000"
+  throughput: "125"
+  encrypted: "true"
+allowVolumeExpansion: true
+
+---
+# StatefulSet for Prometheus Hub
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: prometheus-hub
+  namespace: prometheus-hub
+spec:
+  serviceName: prometheus-hub
+  replicas: 2
+  selector:
+    matchLabels:
+      app: prometheus-hub
+  template:
+    metadata:
+      labels:
+        app: prometheus-hub
+    spec:
+      serviceAccountName: prometheus-hub
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - prometheus-hub
+              topologyKey: kubernetes.io/hostname
+
+      containers:
+        - name: prometheus
+          image: prom/prometheus:latest
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+            - "--storage.tsdb.retention.time=90d"
+            - "--storage.tsdb.retention.size=100GB"
+            - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+            - "--web.console.templates=/usr/share/prometheus/consoles"
+            - "--web.enable-lifecycle"  # Enable reload via API
+
+          ports:
+            - name: web
+              containerPort: 9090
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: storage
+              mountPath: /prometheus
+
+          resources:
+            requests:
+              cpu: 2000m
+              memory: 8Gi
+            limits:
+              cpu: 4000m
+              memory: 16Gi
+
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: 9090
+            initialDelaySeconds: 30
+            periodSeconds: 10
+
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+        # Sidecar for remote write receiving
+        - name: receiver
+          image: prom/prometheus:latest
+          args:
+            - "--config.file=/etc/prometheus/receiver.yml"
+            - "--storage.tsdb.path=/prometheus-receiver"
+            - "--query.replica-labels=replica"
+
+          ports:
+            - name: receiver
+              containerPort: 9009
+            - name: remote-write
+              containerPort: 19291
+
+          volumeMounts:
+            - name: receiver-config
+              mountPath: /etc/prometheus
+
+          resources:
+            requests:
+              cpu: 1000m
+              memory: 4Gi
+            limits:
+              cpu: 2000m
+              memory: 8Gi
+
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-hub-config
+        - name: receiver-config
+          configMap:
+            name: prometheus-receiver-config
+
+  volumeClaimTemplates:
+    - metadata:
+        name: storage
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: prometheus-hub-storage
+        resources:
+          requests:
+            storage: 100Gi
+
+---
+# Service for Prometheus Hub
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-hub
+  namespace: prometheus-hub
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless service for StatefulSet
+  selector:
+    app: prometheus-hub
+  ports:
+    - name: web
+      port: 9090
+      targetPort: 9090
+    - name: remote-write
+      port: 19291
+      targetPort: 19291
+
+---
+# LoadBalancer Service for external access (for remote writes)
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-hub-external
+  namespace: prometheus-hub
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+spec:
+  type: LoadBalancer
+  selector:
+    app: prometheus-hub
+  ports:
+    - name: remote-write
+      port: 443
+      targetPort: 19291
+      protocol: TCP
+
+---
+# Ingress for HTTPS access
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: prometheus-hub-ingress
+  namespace: prometheus-hub
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - prometheus-hub.traceo.io
+      secretName: prometheus-hub-tls
+  rules:
+    - host: prometheus-hub.traceo.io
+      http:
+        paths:
+          - path: /api/v1/write
+            pathType: Prefix
+            backend:
+              service:
+                name: prometheus-hub-external
+                port:
+                  number: 443
+          - path: /api/v1/query
+            pathType: Prefix
+            backend:
+              service:
+                name: prometheus-hub
+                port:
+                  number: 9090
+
+---
+# ServiceMonitor for Prometheus to scrape itself
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: prometheus-hub-self
+  namespace: prometheus-hub
+spec:
+  selector:
+    matchLabels:
+      app: prometheus-hub
+  endpoints:
+    - port: web
+      interval: 30s
+      path: /metrics
+
+---
+# PrometheusRule for hub alerting
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: prometheus-hub-alerts
+  namespace: prometheus-hub
+spec:
+  groups:
+    - name: prometheus_hub
+      interval: 30s
+      rules:
+        - alert: PrometheusHubDown
+          expr: "up{job='prometheus-hub'} == 0"
+          for: 5m
+          labels:
+            severity: critical
+            component: prometheus-hub
+          annotations:
+            summary: "Prometheus hub is down"
+
+        - alert: PrometheusHubHighMemory
+          expr: "(process_resident_memory_bytes / 16GB) > 0.85"
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Prometheus hub memory >85%"
+
+        - alert: PrometheusHubRemoteWriteDropped
+          expr: "rate(prometheus_remote_storage_dropped_samples_total[5m]) > 0"
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Prometheus hub dropping remote write samples"
+
+        - alert: PrometheusHubWALHighDiskUsage
+          expr: "(prometheus_tsdb_wal_segment_current / 1GB) > 10"
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Prometheus hub WAL disk usage >10GB"
+
+---
+# RBAC for Prometheus Hub
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus-hub
+  namespace: prometheus-hub
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus-hub
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/proxy
+      - services
+      - endpoints
+      - pods
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["extensions"]
+    resources:
+      - ingresses
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-hub
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus-hub
+subjects:
+  - kind: ServiceAccount
+    name: prometheus-hub
+    namespace: prometheus-hub
+
+---
+# HorizontalPodAutoscaler for hub
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: prometheus-hub-hpa
+  namespace: prometheus-hub
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: prometheus-hub
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# PodDisruptionBudget for hub
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: prometheus-hub-pdb
+  namespace: prometheus-hub
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: prometheus-hub
