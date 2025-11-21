@@ -1,0 +1,730 @@
+---
+# Phase 7P: Global Scale Infrastructure
+# 7-region deployment with automatic failover and global observability
+# Date: November 21, 2024
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: traceo-global
+  labels:
+    environment: production
+    phase: 7p
+
+---
+# Multi-Region StatefulSet Configuration
+# Deployed to: eu-frankfurt, cn-beijing, ap-mumbai, ap-tokyo, ap-singapore, us-virginia, sa-sao-paulo
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: metrics-service-global
+  namespace: traceo-global
+spec:
+  serviceName: metrics-service-global
+  replicas: 3
+  selector:
+    matchLabels:
+      app: metrics-service
+      deployment: global
+  template:
+    metadata:
+      labels:
+        app: metrics-service
+        deployment: global
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: metrics-service
+            topologyKey: kubernetes.io/hostname
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    node-type: compute-optimized
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+
+      containers:
+      - name: metrics-service
+        image: traceo-metrics-service:7p-latest
+        imagePullPolicy: IfNotPresent
+
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        - name: prom-remote-write
+          containerPort: 9009
+          protocol: TCP
+
+        env:
+        - name: REGION
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['region']
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: DB_HOST
+          value: postgres-global.traceo-global.svc.cluster.local
+        - name: DB_PORT
+          value: "5432"
+        - name: CACHE_HOST
+          value: redis-global.traceo-global.svc.cluster.local
+        - name: JAEGER_AGENT_HOST
+          value: jaeger-agent.traceo-global.svc.cluster.local
+        - name: JAEGER_AGENT_PORT
+          value: "6831"
+        - name: LOG_LEVEL
+          value: info
+
+        resources:
+          requests:
+            cpu: 4
+            memory: 8Gi
+          limits:
+            cpu: 8
+            memory: 16Gi
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+
+        volumeMounts:
+        - name: cache-volume
+          mountPath: /var/cache/traceo
+        - name: wal-volume
+          mountPath: /var/log/traceo/wal
+
+      volumes:
+      - name: cache-volume
+        emptyDir:
+          sizeLimit: 50Gi
+      - name: wal-volume
+        emptyDir:
+          sizeLimit: 100Gi
+
+      terminationGracePeriodSeconds: 300
+
+---
+# Global PostgreSQL StatefulSet with Replication
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-global
+  namespace: traceo-global
+spec:
+  serviceName: postgres-global
+  replicas: 2
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: postgres
+            topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        ports:
+        - containerPort: 5432
+          name: postgres
+
+        env:
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secrets
+              key: password
+
+        resources:
+          requests:
+            cpu: 4
+            memory: 8Gi
+          limits:
+            cpu: 8
+            memory: 16Gi
+
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - pg_isready -U postgres
+          initialDelaySeconds: 30
+          periodSeconds: 10
+
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - pg_isready -U postgres
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+        - name: postgres-wal
+          mountPath: /var/lib/postgresql/wal
+
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 500Gi
+  - metadata:
+      name: postgres-wal
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 100Gi
+
+---
+# Redis Distributed Cache
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-global
+  namespace: traceo-global
+spec:
+  serviceName: redis-global
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+
+        resources:
+          requests:
+            cpu: 2
+            memory: 4Gi
+          limits:
+            cpu: 4
+            memory: 8Gi
+
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+
+  volumeClaimTemplates:
+  - metadata:
+      name: redis-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 100Gi
+
+---
+# Service Mesh for Cross-Region Communication
+apiVersion: v1
+kind: Service
+metadata:
+  name: metrics-service-global
+  namespace: traceo-global
+spec:
+  type: LoadBalancer
+  selector:
+    app: metrics-service
+    deployment: global
+  ports:
+  - port: 80
+    targetPort: 8080
+    name: http
+  - port: 9090
+    targetPort: 9090
+    name: metrics
+
+---
+# Global Load Balancer Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: metrics-global-lb
+  namespace: traceo-global
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+spec:
+  type: LoadBalancer
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600
+  ports:
+  - port: 443
+    targetPort: 8080
+    protocol: TCP
+    name: https
+  selector:
+    app: metrics-service
+    deployment: global
+
+---
+# Prometheus Federation for Global Metrics
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-global-config
+  namespace: traceo-global
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      evaluation_interval: 30s
+      external_labels:
+        cluster: global
+        deployment: 7p
+
+    remote_write:
+    - url: http://mimir-distributor.mimir:9009/api/prom/push
+      write_relabel_configs:
+      - source_labels: [__name__]
+        regex: '(replication_lag|failover|latency|capacity).*'
+        action: keep
+
+    scrape_configs:
+    - job_name: 'metrics-global'
+      static_configs:
+      - targets: ['metrics-service-global:9090']
+      metric_relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - source_labels: [region]
+        target_label: region
+
+    - job_name: 'federate'
+      scrape_interval: 15s
+      metrics_path: '/federate'
+      params:
+        'match[]':
+        - '{job="prometheus"}'
+      static_configs:
+      - targets:
+        - 'localhost:9090'
+
+---
+# Jaeger Deployment for Distributed Tracing
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger-collector-global
+  namespace: traceo-global
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: jaeger-collector
+  template:
+    metadata:
+      labels:
+        app: jaeger-collector
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: jaeger-collector
+              topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: jaeger-collector
+        image: jaegertracing/jaeger:latest
+        ports:
+        - containerPort: 14250
+          name: grpc
+        - containerPort: 14268
+          name: http
+        - containerPort: 14269
+          name: admin
+
+        env:
+        - name: SPAN_STORAGE_TYPE
+          value: badger
+        - name: BADGER_EPHEMERAL
+          value: "false"
+        - name: BADGER_DIRECTORY_VALUE
+          value: /badger/data
+        - name: BADGER_DIRECTORY_KEY
+          value: /badger/key
+
+        resources:
+          requests:
+            cpu: 2
+            memory: 4Gi
+          limits:
+            cpu: 4
+            memory: 8Gi
+
+---
+# Mimir for Centralized Metrics Aggregation
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mimir-distributor-global
+  namespace: traceo-global
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mimir-distributor
+  template:
+    metadata:
+      labels:
+        app: mimir-distributor
+    spec:
+      containers:
+      - name: mimir-distributor
+        image: grafana/mimir:latest
+        args:
+        - -target=distributor
+        - -config.file=/etc/mimir/config.yml
+
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9009
+          name: grpc
+
+        resources:
+          requests:
+            cpu: 4
+            memory: 8Gi
+          limits:
+            cpu: 8
+            memory: 16Gi
+
+        volumeMounts:
+        - name: mimir-config
+          mountPath: /etc/mimir
+
+      volumes:
+      - name: mimir-config
+        configMap:
+          name: mimir-config
+
+---
+# Alertmanager for Global Alert Routing
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-global-config
+  namespace: traceo-global
+data:
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 5m
+
+    route:
+      group_by: ['cluster', 'region', 'alertname']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: 'null'
+      routes:
+      - match:
+          severity: critical
+        receiver: 'critical-pagerduty'
+        group_wait: 0s
+        continue: true
+      - match:
+          region: eu-frankfurt
+        receiver: 'eu-on-call'
+      - match:
+          region: cn-beijing
+        receiver: 'cn-on-call'
+      - match:
+          region: us-virginia
+        receiver: 'us-on-call'
+
+    receivers:
+    - name: 'null'
+    - name: 'critical-pagerduty'
+      pagerduty_configs:
+      - service_key: ${PAGERDUTY_KEY}
+        severity: critical
+    - name: 'eu-on-call'
+      slack_configs:
+      - api_url: ${EU_SLACK_WEBHOOK}
+        channel: '#eu-alerts'
+    - name: 'cn-on-call'
+      slack_configs:
+      - api_url: ${CN_SLACK_WEBHOOK}
+        channel: '#cn-alerts'
+    - name: 'us-on-call'
+      slack_configs:
+      - api_url: ${US_SLACK_WEBHOOK}
+        channel: '#us-alerts'
+
+---
+# HorizontalPodAutoscaler for Global Metrics Service
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: metrics-service-global-hpa
+  namespace: traceo-global
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: metrics-service-global
+  minReplicas: 100
+  maxReplicas: 1000
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  - type: Pods
+    pods:
+      metric:
+        name: metrics_ingested_per_second
+      target:
+        type: AverageValue
+        averageValue: "10000"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+      - type: Pods
+        value: 10
+        periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 300
+      - type: Pods
+        value: 2
+        periodSeconds: 300
+      selectPolicy: Min
+
+---
+# PodDisruptionBudget for High Availability
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: metrics-service-pdb
+  namespace: traceo-global
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: metrics-service
+      deployment: global
+
+---
+# NetworkPolicy for Security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: traceo-global-network-policy
+  namespace: traceo-global
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: traceo-global
+    - podSelector:
+        matchLabels:
+          app: metrics-service
+  egress:
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 5432  # PostgreSQL
+    - protocol: TCP
+      port: 6379  # Redis
+    - protocol: TCP
+      port: 9009  # Mimir
+  - to:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 53   # DNS
+    - protocol: UDP
+      port: 53
+
+---
+# Secrets for Sensitive Data
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secrets
+  namespace: traceo-global
+type: Opaque
+stringData:
+  password: "changeme"  # Use Sealed Secrets in production
+
+---
+# ConfigMap for Application Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traceo-global-config
+  namespace: traceo-global
+data:
+  regions.json: |
+    {
+      "regions": [
+        {"name": "eu-frankfurt", "compliance": "gdpr", "latency_slo_ms": 200},
+        {"name": "cn-beijing", "compliance": "csl_pipl", "latency_slo_ms": 400},
+        {"name": "ap-mumbai", "compliance": "pdp", "latency_slo_ms": 350},
+        {"name": "ap-tokyo", "compliance": "appi", "latency_slo_ms": 250},
+        {"name": "ap-singapore", "compliance": "pdpa", "latency_slo_ms": 200},
+        {"name": "us-virginia", "compliance": "ccpa_hipaa", "latency_slo_ms": 100},
+        {"name": "sa-sao-paulo", "compliance": "lgpd", "latency_slo_ms": 400}
+      ]
+    }
+
+  failover-config.json: |
+    {
+      "detection_threshold": 3,
+      "detection_window_seconds": 30,
+      "failover_targets": {
+        "us-virginia": "eu-frankfurt",
+        "eu-frankfurt": "ap-singapore",
+        "cn-beijing": "ap-tokyo",
+        "ap-mumbai": "ap-singapore",
+        "ap-tokyo": "ap-singapore",
+        "ap-singapore": "us-virginia",
+        "sa-sao-paulo": "us-virginia"
+      }
+    }
+
+---
+# RBAC for Service Accounts
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: traceo-global-sa
+  namespace: traceo-global
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: traceo-global-role
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["statefulsets", "deployments"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: traceo-global-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: traceo-global-role
+subjects:
+- kind: ServiceAccount
+  name: traceo-global-sa
+  namespace: traceo-global
+
+---
+# Liveness and Readiness Probe ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: health-check-scripts
+  namespace: traceo-global
+data:
+  check-health.sh: |
+    #!/bin/sh
+    # Check multiple health indicators
+    curl -f http://localhost:8080/health || exit 1
+    curl -f http://localhost:8080/ready || exit 1
+    exit 0
