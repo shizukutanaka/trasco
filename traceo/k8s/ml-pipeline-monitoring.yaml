@@ -1,0 +1,476 @@
+---
+# ML Pipeline Monitoring Configuration
+# Date: November 21, 2024
+# Purpose: Monitor model performance, data drift, and serving metrics
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-monitoring
+  labels:
+    app: traceo
+    component: ml-monitoring
+
+---
+# Deployment for Evidently AI drift detection
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: evidently-drift-detector
+  namespace: ml-monitoring
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: evidently-drift-detector
+  template:
+    metadata:
+      labels:
+        app: evidently-drift-detector
+    spec:
+      serviceAccountName: ml-serving
+      containers:
+        - name: evidently
+          image: python:3.11-slim
+          workingDir: /app
+          command:
+            - sh
+            - -c
+            - |
+              pip install -q evidently prometheus-client psycopg2-binary boto3
+              python drift_detector.py
+          ports:
+            - containerPort: 8000
+              name: metrics
+          env:
+            - name: POSTGRESQL_HOST
+              value: prometheus-postgres
+            - name: POSTGRESQL_PORT
+              value: "5432"
+            - name: POSTGRESQL_USER
+              value: postgres
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ml-training-secrets
+                  key: postgresql_password
+            - name: PROMETHEUS_PUSHGATEWAY
+              value: prometheus-pushgateway:9091
+            - name: DRIFT_ALERT_THRESHOLD
+              value: "0.3"
+            - name: CHECK_INTERVAL_SECONDS
+              value: "300"
+          resources:
+            requests:
+              cpu: 1
+              memory: 2Gi
+            limits:
+              cpu: 2
+              memory: 4Gi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+---
+# Service for Evidently metrics
+apiVersion: v1
+kind: Service
+metadata:
+  name: evidently-drift-detector
+  namespace: ml-monitoring
+spec:
+  type: ClusterIP
+  selector:
+    app: evidently-drift-detector
+  ports:
+    - name: metrics
+      port: 8000
+      targetPort: 8000
+
+---
+# ServiceMonitor for Prometheus to scrape ML metrics
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ml-serving-monitor
+  namespace: ml-monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+      - ml-serving
+      - ml-monitoring
+  selector:
+    matchLabels:
+      app: ml-feature-transformer
+  endpoints:
+    - port: http
+      interval: 30s
+      path: /metrics
+
+---
+# ServiceMonitor for KServe predictor metrics
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kserve-monitor
+  namespace: ml-monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+      - ml-serving
+  endpoints:
+    - port: metrics
+      interval: 30s
+
+---
+# PrometheusRule for ML pipeline alerts
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ml-pipeline-alerts
+  namespace: ml-monitoring
+spec:
+  groups:
+    - name: ml_serving
+      interval: 30s
+      rules:
+        # Model serving availability
+        - alert: MLModelInferenceServiceDown
+          expr: kserve_model_up{service=~"failure-prediction|anomaly-detection|root-cause-analysis"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            component: ml-serving
+          annotations:
+            summary: "ML model inference service {{ $labels.service }} is down"
+            description: "{{ $labels.service }} has been unavailable for 5 minutes"
+
+        # High inference latency
+        - alert: MLInferenceHighLatency
+          expr: |
+            histogram_quantile(0.99, rate(kserve_request_duration_seconds_bucket[5m])) > 1
+          for: 5m
+          labels:
+            severity: warning
+            component: ml-serving
+          annotations:
+            summary: "ML inference latency high"
+            description: "p99 latency > 1 second for {{ $labels.service }}"
+
+        # High error rate
+        - alert: MLInferenceHighErrorRate
+          expr: |
+            rate(kserve_request_total{status=~"5.."}[5m]) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+            component: ml-serving
+          annotations:
+            summary: "ML inference error rate high"
+            description: "Error rate > 5% for {{ $labels.service }}"
+
+        # Data drift detected
+        - alert: DataDriftDetected
+          expr: |
+            evidently_data_drift_detected == 1
+          for: 10m
+          labels:
+            severity: warning
+            component: ml-monitoring
+          annotations:
+            summary: "Data drift detected in {{ $labels.model }}"
+            description: "Statistical drift detected. Retraining recommended."
+
+        # Model performance degradation
+        - alert: ModelPerformanceDegraded
+          expr: |
+            (ml_model_accuracy) < 0.85
+          for: 30m
+          labels:
+            severity: warning
+            component: ml-monitoring
+          annotations:
+            summary: "Model {{ $labels.model }} performance degraded"
+            description: "Accuracy dropped below 85% threshold"
+
+        # GPU memory pressure
+        - alert: GPUMemoryPressure
+          expr: |
+            (container_memory_usage_bytes{pod=~".*prediction.*|.*detection.*"} / 16GB) > 0.85
+          for: 5m
+          labels:
+            severity: warning
+            component: ml-serving
+          annotations:
+            summary: "GPU memory usage high in {{ $labels.pod }}"
+            description: "Memory usage > 85% on GPU node"
+
+        # Inference queue depth high
+        - alert: InferenceQueueDepthHigh
+          expr: |
+            kserve_queue_depth > 1000
+          for: 5m
+          labels:
+            severity: warning
+            component: ml-serving
+          annotations:
+            summary: "Inference queue depth high"
+            description: "Queue depth > 1000 requests for {{ $labels.service }}"
+
+        # Model retraining failed
+        - alert: ModelRetrainingFailed
+          expr: |
+            kserve_retraining_status == 0
+          for: 1m
+          labels:
+            severity: critical
+            component: ml-monitoring
+          annotations:
+            summary: "Automated model retraining failed"
+            description: "Retraining job for {{ $labels.model }} did not complete successfully"
+
+    - name: ml_training
+      interval: 30s
+      rules:
+        # Training job failure
+        - alert: MLTrainingJobFailed
+          expr: |
+            batch_job_status{job="ml-training-models"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            component: ml-training
+          annotations:
+            summary: "ML training job failed"
+            description: "{{ $labels.job }} completed with failure status"
+
+        # Training job duration exceeded
+        - alert: MLTrainingDurationExceeded
+          expr: |
+            (time() - batch_job_start_time{job=~"ml-training.*"}) > 86400
+          for: 1m
+          labels:
+            severity: warning
+            component: ml-training
+          annotations:
+            summary: "ML training job running too long"
+            description: "{{ $labels.job }} has been running for > 24 hours"
+
+        # GPU utilization low during training
+        - alert: GPUUnderutilized
+          expr: |
+            (avg(rate(nvidia_smi_utilization_gpu[1m])) by (pod)) < 30
+          for: 10m
+          labels:
+            severity: info
+            component: ml-training
+          annotations:
+            summary: "GPU underutilized during training"
+            description: "GPU utilization < 30% for {{ $labels.pod }}"
+
+---
+# ConfigMap for Grafana dashboard
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ml-monitoring-dashboard
+  namespace: ml-monitoring
+data:
+  ml-dashboard.json: |
+    {
+      "dashboard": {
+        "title": "ML Pipeline Monitoring",
+        "panels": [
+          {
+            "title": "Model Inference Latency (p99)",
+            "targets": [
+              {
+                "expr": "histogram_quantile(0.99, rate(kserve_request_duration_seconds_bucket[5m]))"
+              }
+            ]
+          },
+          {
+            "title": "Inference Throughput (req/sec)",
+            "targets": [
+              {
+                "expr": "rate(kserve_request_total[1m])"
+              }
+            ]
+          },
+          {
+            "title": "Model Accuracy Trend",
+            "targets": [
+              {
+                "expr": "ml_model_accuracy{model=~\"failure-prediction|anomaly-detection|root-cause\"}"
+              }
+            ]
+          },
+          {
+            "title": "Data Drift Score",
+            "targets": [
+              {
+                "expr": "evidently_drift_score"
+              }
+            ]
+          },
+          {
+            "title": "Inference Queue Depth",
+            "targets": [
+              {
+                "expr": "kserve_queue_depth"
+              }
+            ]
+          },
+          {
+            "title": "GPU Memory Usage",
+            "targets": [
+              {
+                "expr": "container_memory_usage_bytes{pod=~\".*prediction.*\"}"
+              }
+            ]
+          },
+          {
+            "title": "Error Rate by Model",
+            "targets": [
+              {
+                "expr": "rate(kserve_request_total{status=~\"5..\"}[5m])"
+              }
+            ]
+          },
+          {
+            "title": "Model Serving Pod Count",
+            "targets": [
+              {
+                "expr": "count(kserve_model_up)"
+              }
+            ]
+          }
+        ]
+      }
+    }
+
+---
+# Deployment for model monitoring API
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-monitoring-api
+  namespace: ml-monitoring
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ml-monitoring-api
+  template:
+    metadata:
+      labels:
+        app: ml-monitoring-api
+    spec:
+      serviceAccountName: ml-serving
+      containers:
+        - name: api
+          image: python:3.11-slim
+          workingDir: /app
+          command:
+            - sh
+            - -c
+            - |
+              pip install -q fastapi uvicorn prometheus-client psycopg2-binary mlflow
+              python monitoring_api.py
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: MLFLOW_TRACKING_URI
+              value: http://mlflow-server.ml-pipeline:5000
+            - name: POSTGRESQL_HOST
+              value: prometheus-postgres
+            - name: PROMETHEUS_PUSHGATEWAY
+              value: prometheus-pushgateway:9091
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+---
+# Service for monitoring API
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-monitoring-api
+  namespace: ml-monitoring
+spec:
+  type: ClusterIP
+  selector:
+    app: ml-monitoring-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+
+---
+# Ingress for monitoring API
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ml-monitoring-ingress
+  namespace: ml-monitoring
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - ml-monitoring.traceo.io
+      secretName: ml-monitoring-tls
+  rules:
+    - host: ml-monitoring.traceo.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ml-monitoring-api
+                port:
+                  number: 8000
+
+---
+# ResourceQuota for ml-monitoring namespace
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ml-monitoring-quota
+  namespace: ml-monitoring
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: "20Gi"
+    limits.cpu: "20"
+    limits.memory: "40Gi"
+    pods: "20"

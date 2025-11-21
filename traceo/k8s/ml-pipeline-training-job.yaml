@@ -1,0 +1,560 @@
+---
+# ML Pipeline Training Job Configuration
+# Date: November 21, 2024
+# Purpose: Distributed ML training for failure prediction, anomaly detection, and root cause analysis
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-pipeline
+  labels:
+    app: traceo
+    component: ml-pipeline
+
+---
+# ConfigMap for training configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ml-training-config
+  namespace: ml-pipeline
+data:
+  training_config.json: |
+    {
+      "models": {
+        "failure_prediction": {
+          "type": "ensemble_lstm_rf_prophet",
+          "hyperparameters": {
+            "lstm_units": [64, 32],
+            "lstm_epochs": 50,
+            "lstm_batch_size": 32,
+            "rf_estimators": 100,
+            "rf_max_depth": 15,
+            "rf_min_samples_split": 5
+          }
+        },
+        "anomaly_detection": {
+          "type": "ensemble_iso_elliptic_autoencoder",
+          "hyperparameters": {
+            "isolation_forest_contamination": 0.1,
+            "isolation_forest_estimators": 100,
+            "elliptic_contamination": 0.1,
+            "autoencoder_epochs": 50,
+            "autoencoder_batch_size": 32
+          }
+        },
+        "root_cause_analysis": {
+          "type": "random_forest_classifier",
+          "hyperparameters": {
+            "n_estimators": 200,
+            "max_depth": 20,
+            "min_samples_split": 5
+          }
+        }
+      },
+      "feature_engineering": {
+        "lags": [5, 10, 30, 60],
+        "rolling_windows": [5, 10, 30],
+        "create_interactions": true
+      },
+      "training_data": {
+        "incident_records": 1500,
+        "metric_dimensions": 700,
+        "train_test_split": 0.8,
+        "validation_split": 0.2
+      }
+    }
+
+  mlflow_config.json: |
+    {
+      "tracking_uri": "http://mlflow-server:5000",
+      "experiment_name": "traceo-ml-phase7l",
+      "artifact_location": "s3://traceo-ml-artifacts/",
+      "registry_uri": "http://mlflow-server:5000"
+    }
+
+  data_sources.json: |
+    {
+      "metrics_db": {
+        "type": "postgresql",
+        "host": "prometheus-postgres",
+        "port": 5432,
+        "database": "metrics",
+        "table": "metric_collection",
+        "time_range": "30d"
+      },
+      "incidents_db": {
+        "type": "postgresql",
+        "host": "prometheus-postgres",
+        "port": 5432,
+        "database": "traceo",
+        "table": "incident_records",
+        "filter": "label_status='labeled'"
+      },
+      "s3_bucket": {
+        "name": "traceo-ml-data",
+        "region": "us-east-1",
+        "prefix": "training-data/"
+      }
+    }
+
+---
+# Secret for database credentials
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ml-training-secrets
+  namespace: ml-pipeline
+type: Opaque
+stringData:
+  postgresql_user: postgres
+  postgresql_password: changeme
+  aws_access_key_id: AKIA...
+  aws_secret_access_key: wJal...
+  mlflow_artifact_access_key: mlflow-key
+
+---
+# Service Account for training jobs
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ml-training
+  namespace: ml-pipeline
+
+---
+# Role for training jobs
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ml-training
+  namespace: ml-pipeline
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["get", "list"]
+
+---
+# RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ml-training
+  namespace: ml-pipeline
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ml-training
+subjects:
+  - kind: ServiceAccount
+    name: ml-training
+    namespace: ml-pipeline
+
+---
+# PersistentVolume for training data cache
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ml-training-data-pv
+spec:
+  capacity:
+    storage: 500Gi
+  accessModes:
+    - ReadWriteOnce
+  nfs:
+    server: nfs-server.traceo
+    path: "/exports/ml-training-data"
+
+---
+# PersistentVolumeClaim for training
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ml-training-data
+  namespace: ml-pipeline
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 500Gi
+
+---
+# Storage class for GPU nodes
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ml-training-ssd
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  iops: "16000"
+  throughput: "1000"
+  encrypted: "true"
+allowVolumeExpansion: true
+
+---
+# Training Job for Feature Engineering & Data Preprocessing
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ml-training-feature-engineering
+  namespace: ml-pipeline
+  labels:
+    app: ml-training
+    stage: feature-engineering
+spec:
+  ttlSecondsAfterFinished: 3600
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels:
+        app: ml-training
+        stage: feature-engineering
+    spec:
+      serviceAccountName: ml-training
+      restartPolicy: Never
+
+      initContainers:
+        # Download training data from S3
+        - name: download-training-data
+          image: amazon/aws-cli:2.13.0
+          command:
+            - sh
+            - -c
+            - |
+              aws s3 sync s3://traceo-ml-data/training-data/ /tmp/training-data/ \
+                --region us-east-1
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ml-training-secrets
+                  key: aws_access_key_id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ml-training-secrets
+                  key: aws_secret_access_key
+          volumeMounts:
+            - name: training-data
+              mountPath: /tmp/training-data
+
+      containers:
+        - name: feature-engineering
+          image: python:3.11-slim
+          workingDir: /app
+          command:
+            - sh
+            - -c
+            - |
+              pip install -q pandas scikit-learn scipy numpy tensorflow torch psycopg2-binary boto3
+              python feature_engineering.py
+          env:
+            - name: POSTGRESQL_HOST
+              value: prometheus-postgres
+            - name: POSTGRESQL_PORT
+              value: "5432"
+            - name: POSTGRESQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: ml-training-secrets
+                  key: postgresql_user
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ml-training-secrets
+                  key: postgresql_password
+            - name: S3_BUCKET
+              value: traceo-ml-data
+            - name: AWS_REGION
+              value: us-east-1
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ml-training-secrets
+                  key: aws_access_key_id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ml-training-secrets
+                  key: aws_secret_access_key
+
+          resources:
+            requests:
+              cpu: 4
+              memory: 16Gi
+            limits:
+              cpu: 8
+              memory: 32Gi
+
+          volumeMounts:
+            - name: training-data
+              mountPath: /tmp/training-data
+            - name: training-scripts
+              mountPath: /app
+            - name: training-config
+              mountPath: /etc/ml-training
+
+      volumes:
+        - name: training-data
+          persistentVolumeClaim:
+            claimName: ml-training-data
+        - name: training-scripts
+          configMap:
+            name: ml-training-scripts
+            defaultMode: 0755
+        - name: training-config
+          configMap:
+            name: ml-training-config
+
+---
+# Training Job for Model Training
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ml-training-models
+  namespace: ml-pipeline
+  labels:
+    app: ml-training
+    stage: model-training
+spec:
+  ttlSecondsAfterFinished: 86400
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels:
+        app: ml-training
+        stage: model-training
+    spec:
+      serviceAccountName: ml-training
+      restartPolicy: Never
+
+      # Request GPU nodes
+      nodeSelector:
+        node-type: gpu
+        kubernetes.io/os: linux
+
+      containers:
+        - name: model-training
+          image: tensorflow/tensorflow:2.14.0-gpu
+          workingDir: /app
+          command:
+            - sh
+            - -c
+            - |
+              pip install -q mlflow wandb boto3 scikit-learn scipy statsmodels fbprophet torch
+              python training_pipeline.py
+          env:
+            - name: MLFLOW_TRACKING_URI
+              value: http://mlflow-server:5000
+            - name: MLFLOW_EXPERIMENT_NAME
+              value: traceo-ml-phase7l
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ml-training-secrets
+                  key: wandb_api_key
+            - name: AWS_REGION
+              value: us-east-1
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0,1"
+
+          resources:
+            requests:
+              cpu: 8
+              memory: 32Gi
+              nvidia.com/gpu: 2
+            limits:
+              cpu: 16
+              memory: 64Gi
+              nvidia.com/gpu: 2
+
+          volumeMounts:
+            - name: training-data
+              mountPath: /tmp/training-data
+            - name: training-scripts
+              mountPath: /app
+            - name: training-config
+              mountPath: /etc/ml-training
+
+      volumes:
+        - name: training-data
+          persistentVolumeClaim:
+            claimName: ml-training-data
+        - name: training-scripts
+          configMap:
+            name: ml-training-scripts
+            defaultMode: 0755
+        - name: training-config
+          configMap:
+            name: ml-training-config
+
+---
+# CronJob for weekly automated retraining
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ml-training-weekly
+  namespace: ml-pipeline
+spec:
+  # Run every Sunday at 2 AM UTC
+  schedule: "0 2 * * 0"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: ml-training
+          restartPolicy: Never
+          containers:
+            - name: retraining
+              image: tensorflow/tensorflow:2.14.0-gpu
+              command:
+                - sh
+                - -c
+                - |
+                  python /scripts/automated_retraining.py
+              env:
+                - name: MLFLOW_TRACKING_URI
+                  value: http://mlflow-server:5000
+              resources:
+                requests:
+                  cpu: 4
+                  memory: 16Gi
+                  nvidia.com/gpu: 1
+                limits:
+                  cpu: 8
+                  memory: 32Gi
+                  nvidia.com/gpu: 1
+
+---
+# Deployment for MLflow Server (Model Registry)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow-server
+  namespace: ml-pipeline
+  labels:
+    app: mlflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mlflow
+  template:
+    metadata:
+      labels:
+        app: mlflow
+    spec:
+      containers:
+        - name: mlflow
+          image: ghcr.io/mlflow/mlflow:v2.10.0
+          args:
+            - server
+            - --backend-store-uri=postgresql://postgres:changeme@prometheus-postgres:5432/mlflow
+            - --default-artifact-root=s3://traceo-ml-artifacts/
+            - --host=0.0.0.0
+            - --port=5000
+          ports:
+            - containerPort: 5000
+              name: mlflow
+          env:
+            - name: AWS_REGION
+              value: us-east-1
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ml-training-secrets
+                  key: aws_access_key_id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ml-training-secrets
+                  key: aws_secret_access_key
+          resources:
+            requests:
+              cpu: 2
+              memory: 4Gi
+            limits:
+              cpu: 4
+              memory: 8Gi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+---
+# Service for MLflow Server
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow-server
+  namespace: ml-pipeline
+spec:
+  type: ClusterIP
+  selector:
+    app: mlflow
+  ports:
+    - name: mlflow
+      port: 5000
+      targetPort: 5000
+
+---
+# Ingress for MLflow UI
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mlflow-ingress
+  namespace: ml-pipeline
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - mlflow.traceo.io
+      secretName: mlflow-tls
+  rules:
+    - host: mlflow.traceo.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mlflow-server
+                port:
+                  number: 5000
+
+---
+# ResourceQuota for ml-pipeline namespace
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ml-pipeline-quota
+  namespace: ml-pipeline
+spec:
+  hard:
+    requests.cpu: "30"
+    requests.memory: "120Gi"
+    limits.cpu: "60"
+    limits.memory: "200Gi"
+    pods: "20"
+    nvidia.com/gpu: "6"
+    persistentvolumeclaims: "5"

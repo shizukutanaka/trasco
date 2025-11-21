@@ -1,0 +1,518 @@
+---
+# ML Pipeline Model Serving Configuration with KServe
+# Date: November 21, 2024
+# Purpose: Serve failure prediction, anomaly detection, and root cause models
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-serving
+  labels:
+    app: traceo
+    component: ml-serving
+
+---
+# Secret for model registry credentials
+apiVersion: v1
+kind: Secret
+metadata:
+  name: model-registry-credentials
+  namespace: ml-serving
+type: Opaque
+stringData:
+  mlflow_tracking_uri: http://mlflow-server.ml-pipeline:5000
+  s3_region: us-east-1
+  s3_bucket: traceo-ml-artifacts
+  aws_access_key_id: AKIA...
+  aws_secret_access_key: wJal...
+
+---
+# ConfigMap for inference server configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inference-server-config
+  namespace: ml-serving
+data:
+  model_config.yaml: |
+    models:
+      - name: failure_prediction
+        version: 1
+        handler: failure_prediction_handler.py
+        batch_size: 32
+        max_batch_delay: 100
+      - name: anomaly_detection
+        version: 1
+        handler: anomaly_detection_handler.py
+        batch_size: 64
+        max_batch_delay: 50
+      - name: root_cause_analysis
+        version: 1
+        handler: root_cause_handler.py
+        batch_size: 32
+        max_batch_delay: 100
+
+  feature_config.yaml: |
+    preprocessing:
+      - type: scaling
+        scaler: robust
+        features: [cpu_usage, memory_usage, disk_io]
+      - type: lag_features
+        lags: [5, 10, 30, 60]
+      - type: rolling_statistics
+        windows: [5, 10, 30]
+
+    postprocessing:
+      - type: confidence_threshold
+        threshold: 0.5
+      - type: output_formatting
+        format: json
+
+---
+# ServiceAccount for KServe inference service
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ml-serving
+  namespace: ml-serving
+
+---
+# Role for KServe inference service
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ml-serving
+  namespace: ml-serving
+rules:
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list"]
+
+---
+# RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ml-serving
+  namespace: ml-serving
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ml-serving
+subjects:
+  - kind: ServiceAccount
+    name: ml-serving
+    namespace: ml-serving
+
+---
+# KServe InferenceService for Failure Prediction
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: failure-prediction
+  namespace: ml-serving
+spec:
+  predictor:
+    minReplicas: 5
+    maxReplicas: 50
+
+    # Model URI from MLflow
+    model:
+      modelFormat:
+        name: sklearn
+      storageUri: s3://traceo-ml-artifacts/failure_prediction/model
+
+    # Compute resources
+    resources:
+      requests:
+        cpu: 2
+        memory: 4Gi
+        nvidia.com/gpu: 1
+      limits:
+        cpu: 4
+        memory: 8Gi
+        nvidia.com/gpu: 1
+
+    # Pod specifications
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - failure-prediction
+              topologyKey: kubernetes.io/hostname
+
+    # Environment variables
+    env:
+      - name: MLFLOW_TRACKING_URI
+        valueFrom:
+          secretKeyRef:
+            name: model-registry-credentials
+            key: mlflow_tracking_uri
+
+    # Health checks
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 8080
+      initialDelaySeconds: 60
+      periodSeconds: 10
+
+    readinessProbe:
+      httpGet:
+        path: /ready
+        port: 8080
+      initialDelaySeconds: 10
+      periodSeconds: 5
+
+  # Explainability (optional)
+  explainer:
+    minReplicas: 1
+    maxReplicas: 5
+    model:
+      modelFormat:
+        name: shap
+      storageUri: s3://traceo-ml-artifacts/failure_prediction_explainer/
+
+---
+# KServe InferenceService for Anomaly Detection
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: anomaly-detection
+  namespace: ml-serving
+spec:
+  predictor:
+    minReplicas: 5
+    maxReplicas: 50
+
+    model:
+      modelFormat:
+        name: sklearn
+      storageUri: s3://traceo-ml-artifacts/anomaly_detection/model
+
+    resources:
+      requests:
+        cpu: 2
+        memory: 4Gi
+        nvidia.com/gpu: 1
+      limits:
+        cpu: 4
+        memory: 8Gi
+        nvidia.com/gpu: 1
+
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - anomaly-detection
+              topologyKey: kubernetes.io/hostname
+
+    env:
+      - name: MLFLOW_TRACKING_URI
+        valueFrom:
+          secretKeyRef:
+            name: model-registry-credentials
+            key: mlflow_tracking_uri
+
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 8080
+      initialDelaySeconds: 60
+      periodSeconds: 10
+
+    readinessProbe:
+      httpGet:
+        path: /ready
+        port: 8080
+      initialDelaySeconds: 10
+      periodSeconds: 5
+
+---
+# KServe InferenceService for Root Cause Analysis
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: root-cause-analysis
+  namespace: ml-serving
+spec:
+  predictor:
+    minReplicas: 3
+    maxReplicas: 20
+
+    model:
+      modelFormat:
+        name: sklearn
+      storageUri: s3://traceo-ml-artifacts/root_cause_analysis/model
+
+    resources:
+      requests:
+        cpu: 1
+        memory: 2Gi
+      limits:
+        cpu: 2
+        memory: 4Gi
+
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - root-cause-analysis
+              topologyKey: kubernetes.io/hostname
+
+    env:
+      - name: MLFLOW_TRACKING_URI
+        valueFrom:
+          secretKeyRef:
+            name: model-registry-credentials
+            key: mlflow_tracking_uri
+
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 8080
+      initialDelaySeconds: 60
+      periodSeconds: 10
+
+    readinessProbe:
+      httpGet:
+        path: /ready
+        port: 8080
+      initialDelaySeconds: 10
+      periodSeconds: 5
+
+---
+# Transformer service for feature preprocessing
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-feature-transformer
+  namespace: ml-serving
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ml-feature-transformer
+  template:
+    metadata:
+      labels:
+        app: ml-feature-transformer
+    spec:
+      serviceAccountName: ml-serving
+      containers:
+        - name: transformer
+          image: python:3.11-slim
+          workingDir: /app
+          command:
+            - sh
+            - -c
+            - |
+              pip install -q fastapi uvicorn numpy pandas scikit-learn
+              python feature_transformer.py
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: MLFLOW_TRACKING_URI
+              valueFrom:
+                secretKeyRef:
+                  name: model-registry-credentials
+                  key: mlflow_tracking_uri
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ml-serving
+      volumes:
+        - name: config
+          configMap:
+            name: inference-server-config
+
+---
+# Service for feature transformer
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-feature-transformer
+  namespace: ml-serving
+spec:
+  type: ClusterIP
+  selector:
+    app: ml-feature-transformer
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+
+---
+# PodDisruptionBudget for serving availability
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: failure-prediction-pdb
+  namespace: ml-serving
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: failure-prediction
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: anomaly-detection-pdb
+  namespace: ml-serving
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: anomaly-detection
+
+---
+# NetworkPolicy to restrict traffic
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ml-serving-netpol
+  namespace: ml-serving
+spec:
+  podSelector:
+    matchLabels:
+      app: traceo
+  policyTypes:
+    - Ingress
+    - Egress
+
+  # Allow ingress from Traceo backend
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              app: traceo
+      ports:
+        - protocol: TCP
+          port: 8080
+
+  # Allow egress to MLflow and S3
+  egress:
+    # MLflow
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              component: ml-pipeline
+      ports:
+        - protocol: TCP
+          port: 5000
+
+    # S3 (AWS)
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 443
+
+    # DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+
+---
+# Ingress for model serving endpoints
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ml-serving-ingress
+  namespace: ml-serving
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - ml.traceo.io
+      secretName: ml-serving-tls
+  rules:
+    - host: ml.traceo.io
+      http:
+        paths:
+          - path: /v1/models/failure-prediction
+            pathType: Prefix
+            backend:
+              service:
+                name: failure-prediction-predictor
+                port:
+                  number: 8080
+          - path: /v1/models/anomaly-detection
+            pathType: Prefix
+            backend:
+              service:
+                name: anomaly-detection-predictor
+                port:
+                  number: 8080
+          - path: /v1/models/root-cause-analysis
+            pathType: Prefix
+            backend:
+              service:
+                name: root-cause-analysis-predictor
+                port:
+                  number: 8080
+
+---
+# ResourceQuota for ml-serving namespace
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ml-serving-quota
+  namespace: ml-serving
+spec:
+  hard:
+    requests.cpu: "50"
+    requests.memory: "200Gi"
+    limits.cpu: "100"
+    limits.memory: "400Gi"
+    pods: "150"
+    nvidia.com/gpu: "10"
