@@ -2,6 +2,7 @@
 """
 FinOps Cost Analysis & Anomaly Detection
 ML-based cloud cost optimization and anomaly detection
+Uses unified anomaly detection engine for consistency
 Date: November 21, 2024
 """
 
@@ -10,8 +11,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
+from app.ml.anomaly_detection_engine import CostAnomalyDetector
 
 logger = logging.getLogger(__name__)
 
@@ -104,78 +104,6 @@ class CloudCostAnalyzer:
         }
 
         return breakdown
-
-
-class CostAnomalyDetector:
-    """Detect cost anomalies using ML"""
-
-    def __init__(self, contamination: float = 0.1):
-        self.model = IsolationForest(contamination=contamination, random_state=42)
-        self.scaler = StandardScaler()
-        self.is_fitted = False
-        self.baseline_mean = None
-        self.baseline_std = None
-
-    def fit(self, cost_data: List[float]):
-        """
-        Fit anomaly detector on historical cost data.
-
-        Args:
-            cost_data: List of daily costs
-        """
-        if len(cost_data) < 10:
-            logger.warning("Need at least 10 data points for anomaly detection")
-            return
-
-        X = np.array(cost_data).reshape(-1, 1)
-        X_scaled = self.scaler.fit_transform(X)
-        self.model.fit(X_scaled)
-
-        self.baseline_mean = np.mean(cost_data)
-        self.baseline_std = np.std(cost_data)
-        self.is_fitted = True
-
-        logger.info(f"Fitted anomaly detector: mean={self.baseline_mean:.2f}, "
-                   f"std={self.baseline_std:.2f}")
-
-    def detect_anomalies(self, cost_data: List[float]) -> List[int]:
-        """
-        Detect anomalous costs.
-
-        Returns:
-            List of indices of anomalous data points
-        """
-        if not self.is_fitted:
-            logger.warning("Model not fitted. Call fit() first.")
-            return []
-
-        X = np.array(cost_data).reshape(-1, 1)
-        X_scaled = self.scaler.transform(X)
-        predictions = self.model.predict(X_scaled)
-
-        # -1 indicates anomaly
-        anomaly_indices = [i for i, pred in enumerate(predictions) if pred == -1]
-        return anomaly_indices
-
-    def calculate_anomaly_score(self, cost: float) -> float:
-        """
-        Calculate anomaly score for a single cost value (0-1).
-
-        0 = normal, 1 = anomalous
-        """
-        if not self.is_fitted:
-            return 0.0
-
-        # Standard deviation based scoring
-        if self.baseline_std == 0:
-            return 0.0
-
-        z_score = abs((cost - self.baseline_mean) / self.baseline_std)
-
-        # Convert z-score to anomaly score (0-1)
-        # Assume values >3 std devs away are anomalies
-        anomaly_score = min(z_score / 3.0, 1.0)
-        return anomaly_score
 
 
 class CostAnomalyAlert:
@@ -377,11 +305,16 @@ if __name__ == '__main__':
             )
         )
 
-    # Fit anomaly detector
+    # Fit anomaly detector (using unified engine)
     detector.fit(costs)
 
-    # Detect anomalies
-    anomalies = detector.detect_anomalies(costs)
+    # Detect anomalies in batch
+    costs_list = list(costs)
+    anomalies = []  # Updated to use new detection method
+    for idx, cost in enumerate(costs_list):
+        result = detector.detect_anomaly(cost, costs_list)
+        if result.is_anomaly:
+            anomalies.append(idx)
     print(f"\n=== Anomaly Detection ===")
     print(f"Detected {len(anomalies)} anomalies:")
     for idx in anomalies:

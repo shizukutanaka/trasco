@@ -2,11 +2,12 @@
 ML-Based Threat Detection & Behavioral Analytics System
 
 Hybrid threat detection combining:
-- Isolation Forest for real-time anomaly detection
+- Isolation Forest for real-time anomaly detection (unified engine)
 - LSTM Autoencoder for behavioral pattern detection
 - XGBoost Ensemble for final threat scoring
 
 Target: 97.9% accuracy, 0.8% false positive rate
+Date: November 21, 2024
 """
 
 import numpy as np
@@ -20,13 +21,13 @@ import logging
 from abc import ABC, abstractmethod
 
 # ML Libraries
-from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 import xgboost as xgb
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
+from app.ml.anomaly_detection_engine import IsolationForestAnomalyDetector
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -138,32 +139,29 @@ class ThreatScore:
 
 
 class IsolationForestDetector:
-    """Real-time anomaly detection using Isolation Forest"""
+    """Real-time anomaly detection using Isolation Forest (unified engine wrapper)"""
 
     def __init__(self, contamination: float = 0.05, n_estimators: int = 100):
         """
-        Initialize Isolation Forest detector
+        Initialize Isolation Forest detector wrapper
 
         Args:
             contamination: Expected proportion of anomalies (0.05 = 5%)
-            n_estimators: Number of isolation trees
+            n_estimators: Number of isolation trees (kept for compatibility)
         """
         self.contamination = contamination
-        self.model = IsolationForest(
+        # Use unified IsolationForestAnomalyDetector
+        self.detector = IsolationForestAnomalyDetector(
             contamination=contamination,
-            n_estimators=n_estimators,
-            random_state=42,
-            n_jobs=-1
+            random_state=42
         )
-        self.scaler = StandardScaler()
         self.is_trained = False
 
     def train(self, X: np.ndarray) -> None:
         """Train the detector on normal behavior data"""
-        X_scaled = self.scaler.fit_transform(X)
-        self.model.fit(X_scaled)
+        self.detector.fit(X)
         self.is_trained = True
-        logger.info(f"IsolationForest trained on {X.shape[0]} samples")
+        logger.info(f"IsolationForest (unified) trained on {X.shape[0]} samples")
 
     def predict_anomaly_score(self, X: np.ndarray) -> np.ndarray:
         """
@@ -178,13 +176,11 @@ class IsolationForestDetector:
         if not self.is_trained:
             raise ValueError("Model must be trained first")
 
-        X_scaled = self.scaler.transform(X)
+        # Get anomaly scores from unified detector (0-1 scale)
+        scores = self.detector.get_anomaly_scores(X)
 
-        # Get anomaly scores (-1 to 1, where 1 is normal)
-        scores = -self.model.score_samples(X_scaled)
-
-        # Scale to 0-100
-        scores_normalized = (scores - scores.min()) / (scores.max() - scores.min() + 1e-10) * 100
+        # Scale from 0-1 to 0-100
+        scores_normalized = scores * 100
 
         return scores_normalized
 

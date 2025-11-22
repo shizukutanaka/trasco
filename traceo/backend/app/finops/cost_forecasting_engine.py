@@ -2,6 +2,7 @@
 """
 Cost Forecasting & Budget Management Engine
 90%+ accuracy ML-based cost prediction
+Uses unified anomaly detection engine for consistency
 Date: November 21, 2024
 """
 
@@ -11,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
+from app.ml.anomaly_detection_engine import ZScoreAnomalyDetector
 
 logger = logging.getLogger(__name__)
 
@@ -113,23 +115,19 @@ class CostForecastingModel:
         )
 
     def detect_cost_anomaly(self, tenant_id: str, current_cost: float) -> Tuple[bool, float]:
-        """Detect cost anomalies using Z-score"""
+        """Detect cost anomalies using unified Z-score detector"""
         if tenant_id not in self.baseline_mean:
             return False, 0.0
 
-        mean = self.baseline_mean[tenant_id]
-        std = self.baseline_std[tenant_id]
+        # Use unified detector with stored historical data
+        historical = self.historical_data.get(tenant_id, [])
+        result = ZScoreAnomalyDetector.detect_anomaly(
+            current_cost,
+            historical,
+            threshold=ZScoreAnomalyDetector.THRESHOLD_CRITICAL
+        )
 
-        if std == 0:
-            return False, 0.0
-
-        # Calculate z-score
-        z_score = abs((current_cost - mean) / std)
-
-        # Flag as anomaly if >2.5 standard deviations
-        is_anomaly = z_score > 2.5
-
-        return is_anomaly, z_score
+        return result.is_anomaly, result.z_score if result.z_score else 0.0
 
 
 class BudgetController:

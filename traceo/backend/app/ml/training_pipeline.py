@@ -2,6 +2,7 @@
 """
 ML Training Pipeline for Traceo
 Implements ensemble models for failure prediction, anomaly detection, and root cause analysis
+Uses unified anomaly detection engine for consistency
 Date: November 21, 2024
 """
 
@@ -19,7 +20,7 @@ import mlflow.sklearn
 import mlflow.pytorch
 from sklearn.model_selection import train_test_split, cross_validate
 from sklearn.preprocessing import StandardScaler, RobustScaler
-from sklearn.ensemble import IsolationForest, RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     precision_recall_fscore_support, roc_auc_score, confusion_matrix,
     classification_report, f1_score, accuracy_score
@@ -29,6 +30,7 @@ import joblib
 import psycopg2
 import boto3
 import warnings
+from app.ml.anomaly_detection_engine import IsolationForestAnomalyDetector
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -283,20 +285,23 @@ class AnomalyDetectionModel:
         self.metrics = {}
 
     def build_isolation_forest(self, X: np.ndarray) -> Dict:
-        """Build Isolation Forest"""
+        """Build Isolation Forest using unified detector"""
         logger.info("Training Isolation Forest for anomaly detection...")
 
-        iso_forest = IsolationForest(
+        # Use unified IsolationForest detector
+        iso_detector = IsolationForestAnomalyDetector(
             contamination=0.1,
-            n_estimators=100,
-            random_state=42,
-            n_jobs=-1
+            random_state=42
         )
-        iso_pred = iso_forest.fit_predict(X)
+        iso_detector.fit(X)
+
+        # Get predictions
+        anomaly_indices = iso_detector.detect_anomalies(X)
+        iso_pred = np.array([-1 if i in anomaly_indices else 1 for i in range(len(X))])
         iso_score = (iso_pred == -1).astype(int)
 
         return {
-            'model': iso_forest,
+            'model': iso_detector,
             'predictions': iso_score,
             'anomaly_count': iso_score.sum()
         }
